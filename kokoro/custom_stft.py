@@ -13,6 +13,23 @@ class CustomSTFT(nn.Module):
     window-sum-square normalization.
     """
 
+    window: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
+    weight_forward_real: (  # pyright: ignore[reportUninitializedInstanceVariable]
+        torch.Tensor
+    )
+    weight_forward_imag: (  # pyright: ignore[reportUninitializedInstanceVariable]
+        torch.Tensor
+    )
+    weight_backward_real: (  # pyright: ignore[reportUninitializedInstanceVariable]
+        torch.Tensor
+    )
+    weight_backward_imag: (  # pyright: ignore[reportUninitializedInstanceVariable]
+        torch.Tensor
+    )
+    weight_window_square: (  # pyright: ignore[reportUninitializedInstanceVariable]
+        torch.Tensor
+    )
+
     def __init__(
         self,
         filter_length=800,

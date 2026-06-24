@@ -20,7 +20,7 @@ def generate_audio(
     kokoro_language: str,
     voice: str,
     speed=1,
-) -> Generator[torch.FloatTensor, None, None]:
+) -> Generator[torch.Tensor, None, None]:
     from kokoro import KModel, KPipeline, KokoroInferenceBackend
 
     model = KModel().eval()

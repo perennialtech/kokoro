@@ -231,6 +231,11 @@ class Generator(nn.Module):
         disable_complex=False,
     ):
         super().__init__()
+        if not upsample_rates:
+            raise ValueError("Generator requires at least one upsample rate")
+        if not resblock_kernel_sizes:
+            raise ValueError("Generator requires at least one residual block kernel")
+
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         self.source_upsample_scale = math.prod(upsample_rates) * gen_istft_hop_size
@@ -281,8 +286,9 @@ class Generator(nn.Module):
                 self.noise_res.append(AdaINResBlock1(c_cur, 11, [1, 3, 5], style_dim))
 
         self.post_n_fft = gen_istft_n_fft
+        final_ch = upsample_initial_channel // (2**self.num_upsamples)
         self.conv_post = weight_norm(
-            nn.Conv1d(ch, self.post_n_fft + 2, 7, 1, padding=3)
+            nn.Conv1d(final_ch, self.post_n_fft + 2, 7, 1, padding=3)
         )
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
         self.stft = CustomSTFT(gen_istft_n_fft, gen_istft_hop_size, gen_istft_n_fft)
@@ -311,6 +317,8 @@ class Generator(nn.Module):
             for j in range(self.num_kernels):
                 y = self.resblocks[i * self.num_kernels + j](x, s)
                 xs = y if xs is None else xs + y
+            if xs is None:
+                raise RuntimeError("Generator has no residual blocks")
             x = xs / self.num_kernels
 
         x = self.conv_post(F.leaky_relu(x))
@@ -323,7 +331,7 @@ class Generator(nn.Module):
 
 
 class UpSample1d(nn.Module):
-    def __init__(self, layer_type):
+    def __init__(self, layer_type: str | bool):
         super().__init__()
         self.layer_type = layer_type
 
@@ -340,7 +348,7 @@ class AdainResBlk1d(nn.Module):
         dim_out,
         style_dim=64,
         actv=nn.LeakyReLU(0.2),
-        upsample="none",
+        upsample: str | bool = "none",
         dropout_p=0.0,
     ):
         super().__init__()
@@ -432,25 +440,27 @@ class Decoder(nn.Module):
             disable_complex=disable_complex,
         )
 
-    def decode_features(self, asr, F0_curve, N, s):
-        F0 = self.F0_conv(F0_curve.unsqueeze(1))
-        N = self.N_conv(N.unsqueeze(1))
-        x = self.encode(torch.cat([asr, F0, N], dim=1), s)
+    def decode_features(self, asr, f0_curve, noise, s):
+        f0 = self.F0_conv(f0_curve.unsqueeze(1))
+        noise_features = self.N_conv(noise.unsqueeze(1))
+        x = self.encode(torch.cat([asr, f0, noise_features], dim=1), s)
         asr_res = self.asr_res(asr)
 
         use_res = True
         for block in self.decode:
             if use_res:
-                x = torch.cat([x, asr_res, F0, N], dim=1)
+                x = torch.cat([x, asr_res, f0, noise_features], dim=1)
             x = block(x, s)
             if block.upsample_type != "none":
                 use_res = False
         return x
 
-    def forward_with_har(self, asr, F0_curve, N, s, har):
+    def forward_with_har(self, asr, f0_curve, noise, s, har):
         return self.generator.forward_with_har(
-            self.decode_features(asr, F0_curve, N, s), s, har
+            self.decode_features(asr, f0_curve, noise, s), s, har
         )
 
-    def forward(self, asr, F0_curve, N, s):
-        return self.generator(self.decode_features(asr, F0_curve, N, s), s, F0_curve)
+    def forward(self, asr, f0_curve, noise, s):
+        return self.generator(
+            self.decode_features(asr, f0_curve, noise, s), s, f0_curve
+        )

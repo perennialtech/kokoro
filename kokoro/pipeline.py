@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
 from misaki import en, espeak
-from typing import Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 import json
 import re
 import torch
@@ -52,7 +52,7 @@ class KPipeline:
         self,
         lang_code: str,
         repo_id: Optional[str] = None,
-        vocab: Optional[dict] = None,
+        vocab: Optional[dict[str, int]] = None,
         context_length: Optional[int] = None,
         text_buckets: Sequence[int] = (64, 128, 256, 512),
         trf: bool = False,
@@ -63,25 +63,34 @@ class KPipeline:
             print(
                 f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning."
             )
-        self.repo_id = repo_id
+        self.repo_id: str = repo_id
 
         if vocab is None or context_length is None:
             config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
             with open(config_path, "r", encoding="utf-8") as r:
-                config = json.load(r)
-            vocab = vocab or config["vocab"]
-            context_length = context_length or config["plbert"].get(
-                "max_position_embeddings", 512
-            )
+                config_data: dict[str, Any] = json.load(r)
+
+            if vocab is None:
+                vocab = config_data["vocab"]
+
+            if context_length is None:
+                plbert = config_data.get("plbert", {})
+                if isinstance(plbert, dict):
+                    context_length = plbert.get("max_position_embeddings", 512)
+                else:
+                    context_length = 512
+
+        if vocab is None or context_length is None:
+            raise ValueError("vocab and context_length are required")
 
         lang_code = ALIASES.get(lang_code.lower(), lang_code.lower())
         assert lang_code in LANG_CODES, (lang_code, LANG_CODES)
 
         self.lang_code = lang_code
-        self.vocab = vocab
-        self.context_length = context_length
+        self.vocab: dict[str, int] = vocab
+        self.context_length: int = context_length
         self.text_buckets = tuple(text_buckets)
-        self.voices = {}
+        self.voices: dict[str, torch.Tensor] = {}
 
         if lang_code in "ab":
             try:
@@ -140,9 +149,9 @@ class KPipeline:
         return pack
 
     def load_voice(
-        self, voice: Union[str, torch.FloatTensor], delimiter: str = ","
-    ) -> torch.FloatTensor:
-        if isinstance(voice, torch.FloatTensor):
+        self, voice: Union[str, torch.Tensor], delimiter: str = ","
+    ) -> torch.Tensor:
+        if isinstance(voice, torch.Tensor):
             return voice
         if voice in self.voices:
             return self.voices[voice]
@@ -156,7 +165,7 @@ class KPipeline:
     @staticmethod
     def tokens_to_ps(tokens: List[en.MToken]) -> str:
         return "".join(
-            t.phonemes + (" " if t.whitespace else "") for t in tokens
+            (t.phonemes or "") + (" " if t.whitespace else "") for t in tokens
         ).strip()
 
     @staticmethod
@@ -195,8 +204,9 @@ class KPipeline:
         pcount = 0
 
         for t in tokens:
-            t.phonemes = "" if t.phonemes is None else t.phonemes
-            next_ps = t.phonemes + (" " if t.whitespace else "")
+            phonemes = t.phonemes or ""
+            t.phonemes = phonemes
+            next_ps = phonemes + (" " if t.whitespace else "")
             next_pcount = pcount + len(next_ps.rstrip())
 
             if next_pcount > 510:
@@ -222,10 +232,10 @@ class KPipeline:
     class PreparedInput:
         graphemes: str
         phonemes: str
-        input_ids: torch.LongTensor
-        input_lengths: torch.LongTensor
-        ref_s: torch.FloatTensor
-        speed: torch.FloatTensor
+        input_ids: torch.Tensor
+        input_lengths: torch.Tensor
+        ref_s: torch.Tensor
+        speed: torch.Tensor
         tokens: Optional[List[en.MToken]] = None
         text_index: Optional[int] = None
 
@@ -233,7 +243,7 @@ class KPipeline:
         self,
         graphemes: str,
         phonemes: str,
-        voice: Union[str, torch.FloatTensor],
+        voice: Union[str, torch.Tensor],
         speed: Union[float, Callable[[int], float]] = 1,
         tokens: Optional[List[en.MToken]] = None,
         text_index: Optional[int] = None,
@@ -270,7 +280,7 @@ class KPipeline:
     def prepare_from_tokens(
         self,
         tokens: Union[str, List[en.MToken]],
-        voice: Union[str, torch.FloatTensor],
+        voice: Union[str, torch.Tensor],
         speed: Union[float, Callable[[int], float]] = 1,
     ) -> Generator["KPipeline.PreparedInput", None, None]:
         if isinstance(tokens, str):
@@ -311,7 +321,7 @@ class KPipeline:
     def prepare(
         self,
         text: Union[str, List[str]],
-        voice: Union[str, torch.FloatTensor],
+        voice: Union[str, torch.Tensor],
         speed: Union[float, Callable[[int], float]] = 1,
         split_pattern: Optional[str] = r"\n+",
     ) -> Generator["KPipeline.PreparedInput", None, None]:
@@ -324,6 +334,8 @@ class KPipeline:
 
             if self.lang_code in "ab":
                 _, tokens = self.g2p(graphemes)
+                if tokens is None:
+                    continue
                 for gs, ps, tks in self.en_tokenize(tokens):
                     if ps:
                         yield self.prepare_phonemes(
@@ -346,7 +358,7 @@ class KPipeline:
     __call__ = prepare
 
     @staticmethod
-    def join_timestamps(tokens: List[en.MToken], pred_dur: torch.LongTensor):
+    def join_timestamps(tokens: List[en.MToken], pred_dur: torch.Tensor):
         divisor = 80
         if not tokens or len(pred_dur) < 3:
             return

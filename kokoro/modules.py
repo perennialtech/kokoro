@@ -1,13 +1,35 @@
 from .istftnet import AdainResBlk1d
 from torch.nn.utils.parametrizations import weight_norm
 from transformers import AlbertModel
+from typing import Literal, TypeAlias
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+Nonlinearity: TypeAlias = Literal[
+    "linear",
+    "sigmoid",
+    "tanh",
+    "relu",
+    "leaky_relu",
+    "selu",
+    "conv1d",
+    "conv2d",
+    "conv3d",
+    "conv_transpose1d",
+    "conv_transpose2d",
+    "conv_transpose3d",
+]
+
 
 class LinearNorm(nn.Module):
-    def __init__(self, in_dim, out_dim, bias=True, w_init_gain="linear"):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        bias=True,
+        w_init_gain: Nonlinearity = "linear",
+    ):
         super().__init__()
         self.linear_layer = nn.Linear(in_dim, out_dim, bias=bias)
         nn.init.xavier_uniform_(
@@ -133,17 +155,17 @@ class ProsodyPredictor(nn.Module):
         x, _ = self.shared(x.transpose(-1, -2))
         x = x.transpose(-1, -2)
 
-        F0 = x
+        f0 = x
         for block in self.F0:
-            F0 = block(F0, s)
-        F0 = self.F0_proj(F0)
+            f0 = block(f0, s)
+        f0 = self.F0_proj(f0)
 
-        N = x
+        noise = x
         for block in self.N:
-            N = block(N, s)
-        N = self.N_proj(N)
+            noise = block(noise, s)
+        noise = self.N_proj(noise)
 
-        return F0[:, 0, :], N[:, 0, :]
+        return f0[:, 0, :], noise[:, 0, :]
 
 
 class DurationEncoder(nn.Module):
@@ -175,7 +197,7 @@ class DurationEncoder(nn.Module):
                 x = block(x.transpose(-1, -2), style).transpose(-1, -2)
                 style_time = style.unsqueeze(-1).expand(-1, -1, x.shape[-1])
                 x = torch.cat([x, style_time], dim=1) * valid
-            else:
+            elif isinstance(block, nn.LSTM):
                 block.flatten_parameters()
                 x, _ = block(x.transpose(-1, -2))
                 x = (
@@ -187,5 +209,10 @@ class DurationEncoder(nn.Module):
 
 
 class CustomAlbert(AlbertModel):
-    def forward(self, *args, **kwargs):
-        return super().forward(*args, **kwargs).last_hidden_state
+    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, *args, **kwargs
+    ):
+        output = super().forward(*args, **kwargs)
+        if isinstance(output, tuple):
+            return output[0]
+        return output.last_hidden_state

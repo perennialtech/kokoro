@@ -5,7 +5,7 @@ from huggingface_hub import hf_hub_download
 from loguru import logger
 from torch.nn.utils import parametrize
 from transformers import AlbertConfig
-from typing import Dict, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 import json
 import torch
 
@@ -25,10 +25,10 @@ def _bucket_for(length: int, buckets: Sequence[int]) -> int:
 
 @dataclass
 class FrameExpansion:
-    asr: torch.FloatTensor
-    en: torch.FloatTensor
-    frame_lengths: torch.LongTensor
-    pred_dur: torch.LongTensor
+    asr: torch.Tensor
+    en: torch.Tensor
+    frame_lengths: torch.Tensor
+    pred_dur: torch.Tensor
     frame_bucket: int
 
 
@@ -90,10 +90,10 @@ class KokoroTextDuration(torch.nn.Module):
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        input_lengths: torch.LongTensor,
-        ref_s: torch.FloatTensor,
-        speed: torch.FloatTensor,
+        input_ids: torch.Tensor,
+        input_lengths: torch.Tensor,
+        ref_s: torch.Tensor,
+        speed: torch.Tensor,
     ):
         positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(
             0
@@ -153,25 +153,25 @@ class KokoroAcousticVocoder(torch.nn.Module):
         self.asr_channels = kmodel.bert_encoder.out_features
         self.en_channels = kmodel.predictor.shared.input_size
 
-    def predict_f0n(self, en: torch.FloatTensor, ref_s: torch.FloatTensor):
+    def predict_f0n(self, en: torch.Tensor, ref_s: torch.Tensor):
         return self.predictor.F0Ntrain(en, ref_s[:, 128:])
 
     def forward_with_f0n(
         self,
-        asr: torch.FloatTensor,
-        f0: torch.FloatTensor,
-        n: torch.FloatTensor,
-        ref_s: torch.FloatTensor,
-        har: torch.FloatTensor,
+        asr: torch.Tensor,
+        f0: torch.Tensor,
+        n: torch.Tensor,
+        ref_s: torch.Tensor,
+        har: torch.Tensor,
     ):
         return self.decoder.forward_with_har(asr, f0, n, ref_s[:, :128], har)
 
     def forward(
         self,
-        asr: torch.FloatTensor,
-        en: torch.FloatTensor,
-        ref_s: torch.FloatTensor,
-        har: torch.FloatTensor,
+        asr: torch.Tensor,
+        en: torch.Tensor,
+        ref_s: torch.Tensor,
+        har: torch.Tensor,
     ):
         f0, n = self.predict_f0n(en, ref_s)
         return self.forward_with_f0n(asr, f0, n, ref_s, har)
@@ -231,10 +231,10 @@ class KokoroInferenceBackend:
     @torch.no_grad()
     def __call__(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        input_lengths: Optional[torch.LongTensor] = None,
-        ref_s: Optional[torch.FloatTensor] = None,
-        speed: Optional[torch.FloatTensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        input_lengths: Optional[torch.Tensor] = None,
+        ref_s: Optional[torch.Tensor] = None,
+        speed: Optional[torch.Tensor] = None,
         prepared=None,
     ) -> "KModel.Output":
         if prepared is not None:
@@ -242,6 +242,12 @@ class KokoroInferenceBackend:
             input_lengths = prepared.input_lengths
             ref_s = prepared.ref_s
             speed = prepared.speed
+
+        if input_ids is None or input_lengths is None or ref_s is None or speed is None:
+            raise ValueError(
+                "input_ids, input_lengths, ref_s, and speed are required "
+                "unless prepared is provided"
+            )
 
         device = self.kmodel.device
         input_ids = input_ids.to(device)
@@ -273,7 +279,7 @@ class KokoroInferenceBackend:
 
 
 class KModel(torch.nn.Module):
-    MODEL_NAMES = {
+    MODEL_NAMES: dict[str, str] = {
         "hexgrad/Kokoro-82M": "kokoro-v1_0.pth",
         "hexgrad/Kokoro-82M-v1.1-zh": "kokoro-v1_1-zh.pth",
     }
@@ -281,7 +287,7 @@ class KModel(torch.nn.Module):
     def __init__(
         self,
         repo_id: Optional[str] = None,
-        config: Union[Dict, str, None] = None,
+        config: Union[dict[str, Any], str, None] = None,
         model: Optional[str] = None,
         disable_complex: bool = False,
     ):
@@ -291,43 +297,46 @@ class KModel(torch.nn.Module):
             print(
                 f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning."
             )
-        self.repo_id = repo_id
+        self.repo_id: str = repo_id
 
-        if not isinstance(config, dict):
-            if not config:
+        if isinstance(config, dict):
+            config_data = config
+        else:
+            config_path = config
+            if not config_path:
                 logger.debug("No config provided, downloading from HF")
-                config = hf_hub_download(repo_id=repo_id, filename="config.json")
-            with open(config, "r", encoding="utf-8") as r:
-                config = json.load(r)
+                config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
+            with open(config_path, "r", encoding="utf-8") as r:
+                config_data: dict[str, Any] = json.load(r)
 
-        self.vocab = config["vocab"]
+        self.vocab: dict[str, int] = config_data["vocab"]
         self.bert = CustomAlbert(
-            AlbertConfig(vocab_size=config["n_token"], **config["plbert"])
+            AlbertConfig(vocab_size=config_data["n_token"], **config_data["plbert"])
         )
         self.bert_encoder = torch.nn.Linear(
-            self.bert.config.hidden_size, config["hidden_dim"]
+            self.bert.config.hidden_size, config_data["hidden_dim"]
         )
-        self.context_length = self.bert.config.max_position_embeddings
+        self.context_length: int = self.bert.config.max_position_embeddings
 
         self.predictor = ProsodyPredictor(
-            style_dim=config["style_dim"],
-            d_hid=config["hidden_dim"],
-            nlayers=config["n_layer"],
-            max_dur=config["max_dur"],
-            dropout=config["dropout"],
+            style_dim=config_data["style_dim"],
+            d_hid=config_data["hidden_dim"],
+            nlayers=config_data["n_layer"],
+            max_dur=config_data["max_dur"],
+            dropout=config_data["dropout"],
         )
         self.text_encoder = TextEncoder(
-            channels=config["hidden_dim"],
-            kernel_size=config["text_encoder_kernel_size"],
-            depth=config["n_layer"],
-            n_symbols=config["n_token"],
+            channels=config_data["hidden_dim"],
+            kernel_size=config_data["text_encoder_kernel_size"],
+            depth=config_data["n_layer"],
+            n_symbols=config_data["n_token"],
         )
         self.decoder = Decoder(
-            dim_in=config["hidden_dim"],
-            style_dim=config["style_dim"],
-            dim_out=config["n_mels"],
+            dim_in=config_data["hidden_dim"],
+            style_dim=config_data["style_dim"],
+            dim_out=config_data["n_mels"],
             disable_complex=disable_complex,
-            **config["istftnet"],
+            **config_data["istftnet"],
         )
 
         if not model:
@@ -362,7 +371,7 @@ class KModel(torch.nn.Module):
         self.remove_weight_norm()
         return self
 
-    def compute_harmonic_features(self, f0: torch.FloatTensor):
+    def compute_harmonic_features(self, f0: torch.Tensor):
         return self.decoder.generator.compute_harmonic_features(f0)
 
     def text_duration_module(self):
@@ -403,18 +412,18 @@ class KModel(torch.nn.Module):
 
     @dataclass
     class Output:
-        audio: torch.FloatTensor
-        pred_dur: Optional[torch.LongTensor] = None
-        frame_lengths: Optional[torch.LongTensor] = None
-        duration_float: Optional[torch.FloatTensor] = None
+        audio: torch.Tensor
+        pred_dur: Optional[torch.Tensor] = None
+        frame_lengths: Optional[torch.Tensor] = None
+        duration_float: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        input_lengths: torch.LongTensor,
-        ref_s: torch.FloatTensor,
-        speed: torch.FloatTensor,
+        input_ids: torch.Tensor,
+        input_lengths: torch.Tensor,
+        ref_s: torch.Tensor,
+        speed: torch.Tensor,
     ) -> "KModel.Output":
         return self.inference_backend()(
             input_ids=input_ids, input_lengths=input_lengths, ref_s=ref_s, speed=speed
