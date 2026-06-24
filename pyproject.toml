@@ -33,6 +33,14 @@ kokoro = "kokoro.__main__:main"
 only-include = ["kokoro"]
 only-packages = true
 
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.8",
+    "black>=26.5.1",
+    "isort>=8.0.1",
+    "ruff>=0.15.19",
+]
+
 [project.urls]
 Homepage = "https://github.com/hexgrad/kokoro"
 Repository = "https://github.com/hexgrad/kokoro"
