@@ -10,7 +10,13 @@ from torch.nn.utils import parametrize
 from transformers import AlbertConfig
 
 from .istftnet import Decoder
-from .modules import CustomAlbert, ProsodyPredictor, TextEncoder, run_length_aware_lstm
+from .modules import (
+    CustomAlbert,
+    ProsodyPredictor,
+    TextEncoder,
+    run_length_aware_lstm,
+    force_unpacked_lstm,
+)
 
 DEFAULT_REPO_ID = "hexgrad/Kokoro-82M"
 
@@ -53,6 +59,72 @@ def remove_weight_norm_parametrizations(module: torch.nn.Module) -> None:
     for m in module.modules():
         if parametrize.is_parametrized(m, "weight"):
             parametrize.remove_parametrizations(m, "weight", leave_parametrized=True)
+
+
+def assert_onnx_dynamic_input_axes(
+    path: Union[str, Path],
+    axes: dict[str, tuple[int, ...]],
+) -> None:
+    import onnx
+
+    model = onnx.load(str(path))
+    graph_inputs = {i.name: i for i in model.graph.input}
+
+    for input_name, input_axes in axes.items():
+        if input_name not in graph_inputs:
+            raise RuntimeError(
+                f"{path}: expected ONNX input {input_name!r}, "
+                f"found {sorted(graph_inputs)}"
+            )
+
+        shape = graph_inputs[input_name].type.tensor_type.shape.dim
+
+        for axis in input_axes:
+            if axis >= len(shape):
+                raise RuntimeError(
+                    f"{path}: input {input_name!r} has rank {len(shape)}, "
+                    f"cannot check axis {axis}"
+                )
+
+            dim = shape[axis]
+            if dim.HasField("dim_value"):
+                raise RuntimeError(
+                    f"{path}: input {input_name!r} axis {axis} is static "
+                    f"with value {dim.dim_value}. This ONNX model is not usable "
+                    f"with KokoroONNXBackend exact-length inference."
+                )
+
+
+def export_dynamic_onnx(
+    module: torch.nn.Module,
+    args: tuple[torch.Tensor, ...],
+    path: Union[str, Path],
+    input_names: list[str],
+    output_names: list[str],
+    dynamic_axes: dict[str, dict[int, str]],
+    dynamic_input_axes: dict[str, tuple[int, ...]],
+    opset: int,
+) -> None:
+    # Do not route this model through torch.export first.
+    #
+    # torch.export currently specializes nn.LSTM sequence lengths in this graph
+    # to the example length, which conflicts with the requested dynamic text/frame
+    # axes. The legacy ONNX exporter has a stable symbolic for nn.LSTM and emits
+    # ONNX LSTM nodes with dynamic axes.
+    with force_unpacked_lstm():
+        torch.onnx.export(
+            module,
+            args=args,
+            f=str(path),
+            input_names=input_names,
+            output_names=output_names,
+            opset_version=opset,
+            dynamo=False,
+            dynamic_axes=dynamic_axes,
+            do_constant_folding=True,
+        )
+
+    assert_onnx_dynamic_input_axes(path, dynamic_input_axes)
 
 
 @dataclass
@@ -305,33 +377,37 @@ class KokoroTextDuration(torch.nn.Module):
     ):
         self.eval()
         device = next(self.parameters()).device
+
+        max_text_len = int(self.bert.config.max_position_embeddings)
+        if example_text_length < 1 or example_text_length > max_text_len:
+            raise ValueError(
+                f"example_text_length must be in [1, {max_text_len}], "
+                f"got {example_text_length}"
+            )
+
         args = (
             torch.zeros((1, example_text_length), dtype=torch.long, device=device),
             torch.full((1,), example_text_length, dtype=torch.long, device=device),
             torch.zeros((1, 256), dtype=torch.float32, device=device),
             torch.ones((1,), dtype=torch.float32, device=device),
         )
-        text_len = torch.export.Dim("text_len", min=1)
-        torch.onnx.export(
+
+        export_dynamic_onnx(
             self,
-            args,
-            path,
+            args=args,
+            path=path,
             input_names=["input_ids", "input_lengths", "ref_s", "speed"],
             output_names=["duration_float", "duration_hidden", "text_hidden"],
-            opset_version=opset,
-            dynamo=True,
-            dynamic_shapes={
-                "input_ids": {1: text_len},
-                "input_lengths": {},
-                "ref_s": {},
-                "speed": {},
-            },
             dynamic_axes={
                 "input_ids": {1: "text_len"},
                 "duration_float": {1: "text_len"},
                 "duration_hidden": {1: "text_len"},
                 "text_hidden": {1: "text_len"},
             },
+            dynamic_input_axes={
+                "input_ids": (1,),
+            },
+            opset=opset,
         )
 
 
@@ -373,6 +449,12 @@ class KokoroAcousticVocoder(torch.nn.Module):
     ):
         self.eval()
         device = next(self.parameters()).device
+
+        if example_frame_length < 1:
+            raise ValueError(
+                f"example_frame_length must be positive, got {example_frame_length}"
+            )
+
         args = (
             torch.zeros(
                 (1, self.asr_channels, example_frame_length),
@@ -386,25 +468,23 @@ class KokoroAcousticVocoder(torch.nn.Module):
             ),
             torch.zeros((1, 256), dtype=torch.float32, device=device),
         )
-        frame_len = torch.export.Dim("frame_len", min=1)
-        torch.onnx.export(
+
+        export_dynamic_onnx(
             self,
-            args,
-            path,
+            args=args,
+            path=path,
             input_names=["asr", "en", "ref_s"],
             output_names=["waveform"],
-            opset_version=opset,
-            dynamo=True,
-            dynamic_shapes={
-                "asr": {2: frame_len},
-                "en": {2: frame_len},
-                "ref_s": {},
-            },
             dynamic_axes={
                 "asr": {2: "frame_len"},
                 "en": {2: "frame_len"},
                 "waveform": {2: "sample_len"},
             },
+            dynamic_input_axes={
+                "asr": (2,),
+                "en": (2,),
+            },
+            opset=opset,
         )
 
 

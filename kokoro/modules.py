@@ -5,6 +5,8 @@ from typing import Literal, Optional, TypeAlias
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 Nonlinearity: TypeAlias = Literal[
     "linear",
@@ -20,6 +22,55 @@ Nonlinearity: TypeAlias = Literal[
     "conv_transpose2d",
     "conv_transpose3d",
 ]
+
+_FORCE_UNPACKED_LSTM: ContextVar[bool] = ContextVar(
+    "_FORCE_UNPACKED_LSTM",
+    default=False,
+)
+
+
+@contextmanager
+def force_unpacked_lstm():
+    token = _FORCE_UNPACKED_LSTM.set(True)
+    try:
+        yield
+    finally:
+        _FORCE_UNPACKED_LSTM.reset(token)
+
+
+def _safe_flag(fn) -> bool:
+    try:
+        return bool(fn())
+    except Exception:
+        return False
+
+
+def _should_use_unpacked_lstm_for_export() -> bool:
+    if _FORCE_UNPACKED_LSTM.get():
+        return True
+
+    if _safe_flag(torch.jit.is_tracing):
+        return True
+
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None:
+        is_compiling = getattr(compiler, "is_compiling", None)
+        if is_compiling is not None and _safe_flag(is_compiling):
+            return True
+
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None:
+        is_compiling = getattr(dynamo, "is_compiling", None)
+        if is_compiling is not None and _safe_flag(is_compiling):
+            return True
+
+    onnx = getattr(torch, "onnx", None)
+    if onnx is not None:
+        is_in_onnx_export = getattr(onnx, "is_in_onnx_export", None)
+        if is_in_onnx_export is not None and _safe_flag(is_in_onnx_export):
+            return True
+
+    return False
 
 
 def run_length_aware_lstm(
@@ -42,7 +93,7 @@ def run_length_aware_lstm(
         min=0, max=total_length
     )
 
-    if getattr(torch.compiler, "is_compiling", lambda: False)():
+    if _should_use_unpacked_lstm_for_export():
         y, _ = lstm(x)
     else:
         pack_lengths = mask_lengths.clamp(min=1).detach().to("cpu")
@@ -147,10 +198,9 @@ class AdaLayerNorm(nn.Module):
 
     def forward(self, x, s):
         x = x.transpose(-1, -2).transpose(1, -1)
-        h = self.fc(s).view(s.size(0), -1, 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        gamma = gamma.transpose(1, -1)
-        beta = beta.transpose(1, -1)
+        h = self.fc(s)
+        gamma = h[:, : self.channels].unsqueeze(1)
+        beta = h[:, self.channels :].unsqueeze(1)
         x = F.layer_norm(x, (self.channels,), eps=self.eps)
         x = (1 + gamma) * x + beta
         return x.transpose(1, -1).transpose(-1, -2)
@@ -212,7 +262,7 @@ class ProsodyPredictor(nn.Module):
     def F0Ntrain(self, x, s, lengths: Optional[torch.Tensor] = None):
         x = x.transpose(-1, -2)
         if lengths is None:
-            if not getattr(torch.compiler, "is_compiling", lambda: False)():
+            if not _should_use_unpacked_lstm_for_export():
                 self.shared.flatten_parameters()
             x, _ = self.shared(x)
         else:

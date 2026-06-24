@@ -46,7 +46,9 @@ def load_model_and_backend(
                 model = model.to("cuda")
         elif pytorch_device == "cuda":
             if not torch.cuda.is_available():
-                raise ValueError("PyTorch CUDA device requested, but CUDA is not available")
+                raise ValueError(
+                    "PyTorch CUDA device requested, but CUDA is not available"
+                )
             model = model.to("cuda")
         elif pytorch_device == "cpu":
             model = model.to("cpu")
