@@ -1,4 +1,4 @@
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 
 from loguru import logger
 import sys
@@ -19,4 +19,5 @@ from .model import (
     KokoroTextDuration,
     expand_token_features,
 )
+from .onnx import KONNXModel, KokoroONNXBackend
 from .pipeline import KPipeline

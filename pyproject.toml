@@ -46,3 +46,8 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/hexgrad/kokoro"
 Repository = "https://github.com/hexgrad/kokoro"
+
+[project.optional-dependencies]
+onnx = [
+    "onnxruntime>=1.24.3",
+]

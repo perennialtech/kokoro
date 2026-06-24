@@ -3,11 +3,47 @@ from .modules import CustomAlbert, ProsodyPredictor, TextEncoder
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
+from pathlib import Path
 from torch.nn.utils import parametrize
 from transformers import AlbertConfig
 from typing import Any, Optional, Sequence, Union
 import json
 import torch
+
+DEFAULT_REPO_ID = "hexgrad/Kokoro-82M"
+DEFAULT_TEXT_BUCKETS = (64, 128, 256, 512)
+DEFAULT_FRAME_BUCKETS = (128, 256, 512, 1024, 2048, 4096)
+
+ONNX_TEXT_DURATION_PREFIX = "text_duration"
+ONNX_ACOUSTIC_VOCODER_PREFIX = "acoustic_vocoder"
+
+
+def resolve_repo_id(repo_id: Optional[str]) -> str:
+    if repo_id is None:
+        repo_id = DEFAULT_REPO_ID
+        print(
+            f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning."
+        )
+    return repo_id
+
+
+def load_config_data(
+    repo_id: str, config: Union[dict[str, Any], str, Path, None] = None
+) -> dict[str, Any]:
+    if isinstance(config, dict):
+        return config
+
+    config_path = config
+    if not config_path:
+        logger.debug("No config provided, downloading from HF")
+        config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
+
+    with open(config_path, "r", encoding="utf-8") as r:
+        return json.load(r)
+
+
+def onnx_export_path(output_dir: Union[str, Path], prefix: str, bucket: int) -> Path:
+    return Path(output_dir) / f"{prefix}_{bucket}.onnx"
 
 
 def remove_weight_norm_parametrizations(module: torch.nn.Module) -> None:
@@ -37,7 +73,7 @@ def expand_token_features(
     duration_hidden: torch.Tensor,
     text_hidden: torch.Tensor,
     input_lengths: torch.Tensor,
-    frame_buckets: Sequence[int] = (128, 256, 512, 1024, 2048, 4096),
+    frame_buckets: Sequence[int] = DEFAULT_FRAME_BUCKETS,
 ) -> FrameExpansion:
     """
     Host-side duration rounding and token-to-frame expansion.
@@ -171,30 +207,19 @@ class KokoroAcousticVocoder(torch.nn.Module):
         asr: torch.Tensor,
         en: torch.Tensor,
         ref_s: torch.Tensor,
-        har: torch.Tensor,
     ):
         f0, n = self.predict_f0n(en, ref_s)
-        return self.forward_with_f0n(asr, f0, n, ref_s, har)
+        return self.decoder(asr, f0, n, ref_s[:, :128])
 
     def export_onnx(
         self,
         path: str,
         batch_size: int = 1,
         frame_bucket: int = 512,
-        har_frames: Optional[int] = None,
         opset: int = 18,
     ):
         self.eval()
         device = next(self.parameters()).device
-
-        if har_frames is None:
-            # predict_f0n upsamples the en frames by 2 before deriving harmonics.
-            # We can dynamically calculate the expected shape using the generator!
-            dummy_f0 = torch.zeros((batch_size, frame_bucket * 2), dtype=torch.float32, device=device)
-            dummy_har = self.decoder.generator.compute_harmonic_features(dummy_f0)
-            har_frames = dummy_har.shape[-1]
-
-        n_fft_plus_2 = self.decoder.generator.post_n_fft + 2
         args = (
             torch.zeros(
                 (batch_size, self.asr_channels, frame_bucket),
@@ -207,17 +232,12 @@ class KokoroAcousticVocoder(torch.nn.Module):
                 device=device,
             ),
             torch.zeros((batch_size, 256), dtype=torch.float32, device=device),
-            torch.zeros(
-                (batch_size, n_fft_plus_2, har_frames),
-                dtype=torch.float32,
-                device=device,
-            ),
         )
         torch.onnx.export(
             self,
             args,
             path,
-            input_names=["asr", "en", "ref_s", "har"],
+            input_names=["asr", "en", "ref_s"],
             output_names=["waveform"],
             opset_version=opset,
             dynamo=True,
@@ -228,7 +248,7 @@ class KokoroInferenceBackend:
     def __init__(
         self,
         kmodel: "KModel",
-        frame_buckets: Sequence[int] = (128, 256, 512, 1024, 2048, 4096),
+        frame_buckets: Sequence[int] = DEFAULT_FRAME_BUCKETS,
     ):
         self.kmodel = kmodel.eval()
         self.text_duration = KokoroTextDuration(kmodel).eval()
@@ -294,27 +314,13 @@ class KModel(torch.nn.Module):
     def __init__(
         self,
         repo_id: Optional[str] = None,
-        config: Union[dict[str, Any], str, None] = None,
+        config: Union[dict[str, Any], str, Path, None] = None,
         model: Optional[str] = None,
         disable_complex: bool = False,
     ):
         super().__init__()
-        if repo_id is None:
-            repo_id = "hexgrad/Kokoro-82M"
-            print(
-                f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning."
-            )
-        self.repo_id: str = repo_id
-
-        if isinstance(config, dict):
-            config_data = config
-        else:
-            config_path = config
-            if not config_path:
-                logger.debug("No config provided, downloading from HF")
-                config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
-            with open(config_path, "r", encoding="utf-8") as r:
-                config_data: dict[str, Any] = json.load(r)
+        self.repo_id = resolve_repo_id(repo_id)
+        config_data = load_config_data(self.repo_id, config)
 
         self.vocab: dict[str, int] = config_data["vocab"]
         self.bert = CustomAlbert(
@@ -348,7 +354,7 @@ class KModel(torch.nn.Module):
 
         if not model:
             model = hf_hub_download(
-                repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id]
+                repo_id=self.repo_id, filename=KModel.MODEL_NAMES[self.repo_id]
             )
 
         for key, state_dict in torch.load(
@@ -387,9 +393,7 @@ class KModel(torch.nn.Module):
     def acoustic_vocoder_module(self):
         return KokoroAcousticVocoder(self).eval()
 
-    def inference_backend(
-        self, frame_buckets: Sequence[int] = (128, 256, 512, 1024, 2048, 4096)
-    ):
+    def inference_backend(self, frame_buckets: Sequence[int] = DEFAULT_FRAME_BUCKETS):
         return KokoroInferenceBackend(self, frame_buckets=frame_buckets)
 
     def export_text_duration_onnx(
@@ -405,7 +409,6 @@ class KModel(torch.nn.Module):
         path: str,
         batch_size: int = 1,
         frame_bucket: int = 512,
-        har_frames: Optional[int] = None,
         opset: int = 18,
     ):
         self.prepare_for_export()
@@ -413,9 +416,44 @@ class KModel(torch.nn.Module):
             path,
             batch_size=batch_size,
             frame_bucket=frame_bucket,
-            har_frames=har_frames,
             opset=opset,
         )
+
+    def export_onnx(
+        self,
+        output_dir: Union[str, Path],
+        batch_size: int = 1,
+        text_buckets: Sequence[int] = DEFAULT_TEXT_BUCKETS,
+        frame_buckets: Sequence[int] = DEFAULT_FRAME_BUCKETS,
+        opset: int = 18,
+    ) -> dict[str, list[Path]]:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.prepare_for_export()
+        text_duration = self.text_duration_module()
+        acoustic_vocoder = self.acoustic_vocoder_module()
+
+        paths: dict[str, list[Path]] = {
+            ONNX_TEXT_DURATION_PREFIX: [],
+            ONNX_ACOUSTIC_VOCODER_PREFIX: [],
+        }
+
+        for bucket in text_buckets:
+            path = onnx_export_path(output_dir, ONNX_TEXT_DURATION_PREFIX, bucket)
+            text_duration.export_onnx(
+                str(path), batch_size=batch_size, text_bucket=bucket, opset=opset
+            )
+            paths[ONNX_TEXT_DURATION_PREFIX].append(path)
+
+        for bucket in frame_buckets:
+            path = onnx_export_path(output_dir, ONNX_ACOUSTIC_VOCODER_PREFIX, bucket)
+            acoustic_vocoder.export_onnx(
+                str(path), batch_size=batch_size, frame_bucket=bucket, opset=opset
+            )
+            paths[ONNX_ACOUSTIC_VOCODER_PREFIX].append(path)
+
+        return paths
 
     @dataclass
     class Output:
