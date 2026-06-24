@@ -12,7 +12,7 @@ from loguru import logger
 languages = ["a", "b", "h", "e", "f", "i", "p", "j", "z"]
 
 if TYPE_CHECKING:
-    from kokoro import KModel
+    pass
 
 
 def generate_audio(
@@ -38,7 +38,9 @@ def generate_audio(
     if isinstance(voice, str) and not voice.startswith(kokoro_language):
         logger.warning(f"Voice {voice} is not made for language {kokoro_language}")
 
-    for prepared in frontend.prepare(text, voice=voice, speed=speed, split_pattern=r"\n+"):
+    for prepared in frontend.prepare(
+        text, voice=voice, speed=speed, split_pattern=r"\n+"
+    ):
         logger.debug(prepared.phonemes)
         output = backend(prepared=prepared)
         yield output.audio.detach().cpu().reshape(-1)
@@ -56,8 +58,12 @@ def generate_and_save_audio(
         wav_file.setsampwidth(2)
         wav_file.setframerate(24000)
 
-        for audio in generate_audio(text, kokoro_language=kokoro_language, voice=voice, speed=speed):
-            audio_bytes = (audio.numpy() * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+        for audio in generate_audio(
+            text, kokoro_language=kokoro_language, voice=voice, speed=speed
+        ):
+            audio_bytes = (
+                (audio.numpy() * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+            )
             wav_file.writeframes(audio_bytes)
 
 
@@ -65,11 +71,24 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--voice", default="af_heart", help="Voice to use")
     parser.add_argument("-l", "--language", choices=languages, help="Language to use")
-    parser.add_argument("-o", "--output-file", "--output_file", type=Path, required=True, help="Path to output WAV file")
-    parser.add_argument("-i", "--input-file", "--input_file", type=Path, help="Path to input text file")
-    parser.add_argument("-t", "--text", help="Text to use instead of reading from stdin")
+    parser.add_argument(
+        "-o",
+        "--output-file",
+        "--output_file",
+        type=Path,
+        required=True,
+        help="Path to output WAV file",
+    )
+    parser.add_argument(
+        "-i", "--input-file", "--input_file", type=Path, help="Path to input text file"
+    )
+    parser.add_argument(
+        "-t", "--text", help="Text to use instead of reading from stdin"
+    )
     parser.add_argument("-s", "--speed", type=float, default=1.0, help="Speech speed")
-    parser.add_argument("--debug", action="store_true", help="Print DEBUG messages to console")
+    parser.add_argument(
+        "--debug", action="store_true", help="Print DEBUG messages to console"
+    )
     args = parser.parse_args()
 
     if args.debug:
@@ -85,6 +104,7 @@ def main() -> None:
         text = args.input_file.read_text()
     else:
         import sys
+
         print("Press Ctrl+D to stop reading input and start generating", flush=True)
         text = "".join(sys.stdin)
 

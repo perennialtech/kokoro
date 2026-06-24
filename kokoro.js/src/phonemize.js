@@ -76,7 +76,14 @@ function flip_money(match) {
   }
   const [b, c] = match.slice(1).split(".");
   const d = parseInt(c.padEnd(2, "0"), 10);
-  let coins = match[0] === "$" ? (d === 1 ? "cent" : "cents") : d === 1 ? "penny" : "pence";
+  let coins =
+    match[0] === "$"
+      ? d === 1
+        ? "cent"
+        : "cents"
+      : d === 1
+        ? "penny"
+        : "pence";
   return `${b} ${bill}${b === "1" ? "" : "s"} and ${d} ${coins}`;
 }
 
@@ -131,9 +138,15 @@ function normalize_text(text) {
       .replace(/\b(y)eah?\b/gi, "$1e'a")
 
       // 5. Handle numbers and currencies
-      .replace(/\d*\.\d+|\b\d{4}s?\b|(?<!:)\b(?:[1-9]|1[0-2]):[0-5]\d\b(?!:)/g, split_num)
+      .replace(
+        /\d*\.\d+|\b\d{4}s?\b|(?<!:)\b(?:[1-9]|1[0-2]):[0-5]\d\b(?!:)/g,
+        split_num,
+      )
       .replace(/(?<=\d),(?=\d)/g, "")
-      .replace(/[$£]\d+(?:\.\d+)?(?: hundred| thousand| (?:[bm]|tr)illion)*\b|[$£]\d+\.\d\d?\b/gi, flip_money)
+      .replace(
+        /[$£]\d+(?:\.\d+)?(?: hundred| thousand| (?:[bm]|tr)illion)*\b|[$£]\d+\.\d\d?\b/gi,
+        flip_money,
+      )
       .replace(/\d*\.\d+/g, point_num)
       .replace(/(?<=\d)-(?=\d)/g, " to ")
       .replace(/(?<=\d)S/g, " S")
@@ -162,7 +175,10 @@ function escapeRegExp(string) {
 }
 
 const PUNCTUATION = ';:,.!?¡¿—…"«»“”(){}[]';
-const PUNCTUATION_PATTERN = new RegExp(`(\\s*[${escapeRegExp(PUNCTUATION)}]+\\s*)+`, "g");
+const PUNCTUATION_PATTERN = new RegExp(
+  `(\\s*[${escapeRegExp(PUNCTUATION)}]+\\s*)+`,
+  "g",
+);
 
 /**
  * Phonemize text using the eSpeak-NG phonemizer
@@ -182,7 +198,13 @@ export async function phonemize(text, language = "a", norm = true) {
 
   // 3. Convert each section to phonemes
   const lang = language === "a" ? "en-us" : "en";
-  const ps = (await Promise.all(sections.map(async ({ match, text }) => (match ? text : (await espeakng(text, lang)).join(" "))))).join("");
+  const ps = (
+    await Promise.all(
+      sections.map(async ({ match, text }) =>
+        match ? text : (await espeakng(text, lang)).join(" "),
+      ),
+    )
+  ).join("");
 
   // 4. Post-process phonemes
   let processed = ps

@@ -25,5 +25,9 @@ self.addEventListener("message", async (e) => {
 
   // Send the audio file back to the main thread
   const blob = audio.toBlob();
-  self.postMessage({ status: "complete", audio: URL.createObjectURL(blob), text });
+  self.postMessage({
+    status: "complete",
+    audio: URL.createObjectURL(blob),
+    text,
+  });
 });

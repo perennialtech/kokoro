@@ -1,4 +1,10 @@
-import { env as hf, StyleTextToSpeech2Model, AutoTokenizer, Tensor, RawAudio } from "@huggingface/transformers";
+import {
+  env as hf,
+  StyleTextToSpeech2Model,
+  AutoTokenizer,
+  Tensor,
+  RawAudio,
+} from "@huggingface/transformers";
 import { phonemize } from "./phonemize.js";
 import { TextSplitterStream } from "./splitter.js";
 import { getVoiceData, VOICES } from "./voices.js";
@@ -38,9 +44,18 @@ export class KokoroTTS {
    * @param {import("@huggingface/transformers").ProgressCallback} [options.progress_callback=null] A callback function that is called with progress information.
    * @returns {Promise<KokoroTTS>} The loaded model
    */
-  static async from_pretrained(model_id, { dtype = "fp32", device = null, progress_callback = null } = {}) {
-    const model = StyleTextToSpeech2Model.from_pretrained(model_id, { progress_callback, dtype, device });
-    const tokenizer = AutoTokenizer.from_pretrained(model_id, { progress_callback });
+  static async from_pretrained(
+    model_id,
+    { dtype = "fp32", device = null, progress_callback = null } = {},
+  ) {
+    const model = StyleTextToSpeech2Model.from_pretrained(model_id, {
+      progress_callback,
+      dtype,
+      device,
+    });
+    const tokenizer = AutoTokenizer.from_pretrained(model_id, {
+      progress_callback,
+    });
 
     const info = await Promise.all([model, tokenizer]);
     return new KokoroTTS(...info);
@@ -58,7 +73,9 @@ export class KokoroTTS {
     if (!VOICES.hasOwnProperty(voice)) {
       console.error(`Voice "${voice}" not found. Available voices:`);
       console.table(VOICES);
-      throw new Error(`Voice "${voice}" not found. Should be one of: ${Object.keys(VOICES).join(", ")}.`);
+      throw new Error(
+        `Voice "${voice}" not found. Should be one of: ${Object.keys(VOICES).join(", ")}.`,
+      );
     }
     const language = /** @type {"a"|"b"} */ (voice.at(0)); // "a" or "b"
     return language;
@@ -115,7 +132,10 @@ export class KokoroTTS {
    * @param {StreamGenerateOptions} options Additional options
    * @returns {AsyncGenerator<{text: string, phonemes: string, audio: RawAudio}, void, void>}
    */
-  async *stream(text, { voice = "af_heart", speed = 1, split_pattern = null } = {}) {
+  async *stream(
+    text,
+    { voice = "af_heart", speed = 1, split_pattern = null } = {},
+  ) {
     const language = this._validate_voice(voice);
 
     /** @type {TextSplitterStream} */
@@ -126,13 +146,15 @@ export class KokoroTTS {
       splitter = new TextSplitterStream();
       const chunks = split_pattern
         ? text
-          .split(split_pattern)
-          .map((chunk) => chunk.trim())
-          .filter((chunk) => chunk.length > 0)
+            .split(split_pattern)
+            .map((chunk) => chunk.trim())
+            .filter((chunk) => chunk.length > 0)
         : [text];
       splitter.push(...chunks);
     } else {
-      throw new Error("Invalid input type. Expected string or TextSplitterStream.");
+      throw new Error(
+        "Invalid input type. Expected string or TextSplitterStream.",
+      );
     }
     for await (const sentence of splitter) {
       const phonemes = await phonemize(sentence, language);
@@ -151,10 +173,10 @@ export class KokoroTTS {
 
 export const env = {
   set cacheDir(value) {
-    hf.cacheDir = value
+    hf.cacheDir = value;
   },
   get cacheDir() {
-    return hf.cacheDir
+    return hf.cacheDir;
   },
   set wasmPaths(value) {
     hf.backends.onnx.wasm.wasmPaths = value;

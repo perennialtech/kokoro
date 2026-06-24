@@ -95,7 +95,9 @@ class KokoroTextDuration(torch.nn.Module):
         ref_s: torch.FloatTensor,
         speed: torch.FloatTensor,
     ):
-        positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(
+            0
+        )
         text_mask = positions >= input_lengths.unsqueeze(1)
         valid = (~text_mask).to(dtype=ref_s.dtype)
 
@@ -103,7 +105,9 @@ class KokoroTextDuration(torch.nn.Module):
         d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
 
         duration_style = ref_s[:, 128:]
-        duration_hidden = self.predictor.text_encoder(d_en, duration_style, input_lengths, text_mask)
+        duration_hidden = self.predictor.text_encoder(
+            d_en, duration_style, input_lengths, text_mask
+        )
 
         self.predictor.lstm.flatten_parameters()
         x, _ = self.predictor.lstm(duration_hidden)
@@ -111,13 +115,17 @@ class KokoroTextDuration(torch.nn.Module):
         duration = duration / speed.reshape(-1, 1).to(duration.dtype)
         duration = duration * valid
 
-        text_hidden = self.text_encoder(input_ids, input_lengths, text_mask).transpose(-1, -2)
+        text_hidden = self.text_encoder(input_ids, input_lengths, text_mask).transpose(
+            -1, -2
+        )
         text_hidden = text_hidden * valid.unsqueeze(-1)
         duration_hidden = duration_hidden * valid.unsqueeze(-1)
 
         return duration, duration_hidden, text_hidden
 
-    def export_onnx(self, path: str, batch_size: int = 1, text_bucket: int = 512, opset: int = 18):
+    def export_onnx(
+        self, path: str, batch_size: int = 1, text_bucket: int = 512, opset: int = 18
+    ):
         self.eval()
         device = next(self.parameters()).device
         args = (
@@ -181,10 +189,22 @@ class KokoroAcousticVocoder(torch.nn.Module):
         har_frames = har_frames or frame_bucket
         n_fft_plus_2 = self.decoder.generator.post_n_fft + 2
         args = (
-            torch.zeros((batch_size, self.asr_channels, frame_bucket), dtype=torch.float32, device=device),
-            torch.zeros((batch_size, self.en_channels, frame_bucket), dtype=torch.float32, device=device),
+            torch.zeros(
+                (batch_size, self.asr_channels, frame_bucket),
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.zeros(
+                (batch_size, self.en_channels, frame_bucket),
+                dtype=torch.float32,
+                device=device,
+            ),
             torch.zeros((batch_size, 256), dtype=torch.float32, device=device),
-            torch.zeros((batch_size, n_fft_plus_2, har_frames), dtype=torch.float32, device=device),
+            torch.zeros(
+                (batch_size, n_fft_plus_2, har_frames),
+                dtype=torch.float32,
+                device=device,
+            ),
         )
         torch.onnx.export(
             self,
@@ -229,8 +249,16 @@ class KokoroInferenceBackend:
         ref_s = ref_s.to(device)
         speed = speed.to(device)
 
-        duration_float, duration_hidden, text_hidden = self.text_duration(input_ids, input_lengths, ref_s, speed)
-        frames = expand_token_features(duration_float, duration_hidden, text_hidden, input_lengths, self.frame_buckets)
+        duration_float, duration_hidden, text_hidden = self.text_duration(
+            input_ids, input_lengths, ref_s, speed
+        )
+        frames = expand_token_features(
+            duration_float,
+            duration_hidden,
+            text_hidden,
+            input_lengths,
+            self.frame_buckets,
+        )
 
         f0, n = self.acoustic_vocoder.predict_f0n(frames.en, ref_s)
         har = self.kmodel.compute_harmonic_features(f0)
@@ -260,7 +288,9 @@ class KModel(torch.nn.Module):
         super().__init__()
         if repo_id is None:
             repo_id = "hexgrad/Kokoro-82M"
-            print(f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning.")
+            print(
+                f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning."
+            )
         self.repo_id = repo_id
 
         if not isinstance(config, dict):
@@ -271,8 +301,12 @@ class KModel(torch.nn.Module):
                 config = json.load(r)
 
         self.vocab = config["vocab"]
-        self.bert = CustomAlbert(AlbertConfig(vocab_size=config["n_token"], **config["plbert"]))
-        self.bert_encoder = torch.nn.Linear(self.bert.config.hidden_size, config["hidden_dim"])
+        self.bert = CustomAlbert(
+            AlbertConfig(vocab_size=config["n_token"], **config["plbert"])
+        )
+        self.bert_encoder = torch.nn.Linear(
+            self.bert.config.hidden_size, config["hidden_dim"]
+        )
         self.context_length = self.bert.config.max_position_embeddings
 
         self.predictor = ProsodyPredictor(
@@ -297,14 +331,20 @@ class KModel(torch.nn.Module):
         )
 
         if not model:
-            model = hf_hub_download(repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id])
+            model = hf_hub_download(
+                repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id]
+            )
 
-        for key, state_dict in torch.load(model, map_location="cpu", weights_only=True).items():
+        for key, state_dict in torch.load(
+            model, map_location="cpu", weights_only=True
+        ).items():
             assert hasattr(self, key), key
             try:
                 getattr(self, key).load_state_dict(state_dict)
             except Exception:
-                logger.debug(f"Did not directly load {key}; retrying with stripped module prefix")
+                logger.debug(
+                    f"Did not directly load {key}; retrying with stripped module prefix"
+                )
                 state_dict = {k[7:]: v for k, v in state_dict.items()}
                 getattr(self, key).load_state_dict(state_dict, strict=False)
 
@@ -331,12 +371,18 @@ class KModel(torch.nn.Module):
     def acoustic_vocoder_module(self):
         return KokoroAcousticVocoder(self).eval()
 
-    def inference_backend(self, frame_buckets: Sequence[int] = (128, 256, 512, 1024, 2048, 4096)):
+    def inference_backend(
+        self, frame_buckets: Sequence[int] = (128, 256, 512, 1024, 2048, 4096)
+    ):
         return KokoroInferenceBackend(self, frame_buckets=frame_buckets)
 
-    def export_text_duration_onnx(self, path: str, batch_size: int = 1, text_bucket: int = 512, opset: int = 18):
+    def export_text_duration_onnx(
+        self, path: str, batch_size: int = 1, text_bucket: int = 512, opset: int = 18
+    ):
         self.prepare_for_export()
-        return self.text_duration_module().export_onnx(path, batch_size=batch_size, text_bucket=text_bucket, opset=opset)
+        return self.text_duration_module().export_onnx(
+            path, batch_size=batch_size, text_bucket=text_bucket, opset=opset
+        )
 
     def export_acoustic_vocoder_onnx(
         self,
@@ -370,4 +416,6 @@ class KModel(torch.nn.Module):
         ref_s: torch.FloatTensor,
         speed: torch.FloatTensor,
     ) -> "KModel.Output":
-        return self.inference_backend()(input_ids=input_ids, input_lengths=input_lengths, ref_s=ref_s, speed=speed)
+        return self.inference_backend()(
+            input_ids=input_ids, input_lengths=input_lengths, ref_s=ref_s, speed=speed
+        )

@@ -418,35 +418,34 @@ export const VOICES = Object.freeze({
   // },
 });
 
-
 /**
  * The base URL for fetching voice data files.
  */
-let voiceDataUrl = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices";
-
+let voiceDataUrl =
+  "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices";
 
 /**
  * Retrieves the current voice data URL.
- * 
+ *
  * @returns The current voice data URL.
  */
 export function getVoiceDataUrl() {
   return voiceDataUrl;
-};
+}
 
 /**
  * Sets a new voice data URL.
- * 
+ *
  * @param url - The new URL to set for voice data.
  * @throws Will throw an error if the URL is not a valid non-empty string.
  */
 export function setVoiceDataUrl(url) {
-  if (typeof url === 'string' && url.trim() !== '') {
+  if (typeof url === "string" && url.trim() !== "") {
     voiceDataUrl = url;
   } else {
     throw new Error("Invalid URL");
   }
-};
+}
 
 /**
  *
@@ -454,8 +453,9 @@ export function setVoiceDataUrl(url) {
  * @returns {Promise<ArrayBufferLike>}
  */
 async function getVoiceFile(id) {
-  if (fs && Object.hasOwn(fs, 'readFile')) {
-    const dirname = typeof __dirname !== "undefined" ? __dirname : import.meta.dirname;
+  if (fs && Object.hasOwn(fs, "readFile")) {
+    const dirname =
+      typeof __dirname !== "undefined" ? __dirname : import.meta.dirname;
     const file = path.resolve(dirname, `../voices/${id}.bin`);
     const { buffer } = await fs.readFile(file);
     return buffer;

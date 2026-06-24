@@ -37,7 +37,58 @@ function getTokenFromBuffer(buffer, start) {
 
 // List of common abbreviations. Note that strings with single letters joined by periods
 // (e.g., "i.e", "e.g", "u.s.a", "u.s") are handled separately.
-const ABBREVIATIONS = new Set(["mr", "mrs", "ms", "dr", "prof", "sr", "jr", "sgt", "col", "gen", "rep", "sen", "gov", "lt", "maj", "capt", "st", "mt", "etc", "co", "inc", "ltd", "dept", "vs", "p", "pg", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "sun", "mon", "tu", "tue", "tues", "wed", "th", "thu", "thur", "thurs", "fri", "sat"]);
+const ABBREVIATIONS = new Set([
+  "mr",
+  "mrs",
+  "ms",
+  "dr",
+  "prof",
+  "sr",
+  "jr",
+  "sgt",
+  "col",
+  "gen",
+  "rep",
+  "sen",
+  "gov",
+  "lt",
+  "maj",
+  "capt",
+  "st",
+  "mt",
+  "etc",
+  "co",
+  "inc",
+  "ltd",
+  "dept",
+  "vs",
+  "p",
+  "pg",
+  "jan",
+  "feb",
+  "mar",
+  "apr",
+  "jun",
+  "jul",
+  "aug",
+  "sep",
+  "sept",
+  "oct",
+  "nov",
+  "dec",
+  "sun",
+  "mon",
+  "tu",
+  "tue",
+  "tues",
+  "wed",
+  "th",
+  "thu",
+  "thur",
+  "thurs",
+  "fri",
+  "sat",
+]);
 
 /**
  * Determines if the given token (or series of initials) is a known abbreviation.
@@ -81,7 +132,13 @@ function updateStack(c, stack, i, buffer) {
   // Handle standard quotes.
   if (c === '"' || c === "'") {
     // Ignore an apostrophe if it's between letters (e.g., in contractions).
-    if (c === "'" && i > 0 && i < buffer.length - 1 && /[A-Za-z]/.test(buffer[i - 1]) && /[A-Za-z]/.test(buffer[i + 1])) {
+    if (
+      c === "'" &&
+      i > 0 &&
+      i < buffer.length - 1 &&
+      /[A-Za-z]/.test(buffer[i - 1]) &&
+      /[A-Za-z]/.test(buffer[i + 1])
+    ) {
       return;
     }
     if (stack.length && stack.at(-1) === c) {
@@ -234,7 +291,10 @@ export class TextSplitterStream {
         // --- URL/email protection ---
         // If the token appears to be a URL or email (contains "://" or "@")
         // and does not already end with a terminator, skip splitting.
-        if ((/https?[,:]\/\//.test(token) || token.includes("@")) && !isSentenceTerminator(token.at(-1))) {
+        if (
+          (/https?[,:]\/\//.test(token) || token.includes("@")) &&
+          !isSentenceTerminator(token.at(-1))
+        ) {
           i = tokenStart + token.length;
           continue;
         }
@@ -248,7 +308,11 @@ export class TextSplitterStream {
         // --- Middle initials heuristic ---
         // If the token is a series of single-letter initials (each ending in a period)
         // and is followed by a capitalized word, assume it's part of a name.
-        if (/^([A-Za-z]\.)+$/.test(token) && nextNonSpace < len && /[A-Z]/.test(buffer[nextNonSpace])) {
+        if (
+          /^([A-Za-z]\.)+$/.test(token) &&
+          nextNonSpace < len &&
+          /[A-Z]/.test(buffer[nextNonSpace])
+        ) {
           ++i;
           continue;
         }
@@ -256,13 +320,19 @@ export class TextSplitterStream {
         // --- Lookahead heuristic ---
         // If the terminator is a period and the next non–whitespace character is lowercase,
         // assume it is not the end of a sentence.
-        if (c === "." && nextNonSpace < len && /[a-z]/.test(buffer[nextNonSpace])) {
+        if (
+          c === "." &&
+          nextNonSpace < len &&
+          /[a-z]/.test(buffer[nextNonSpace])
+        ) {
           ++i;
           continue;
         }
 
         // Special case: ellipsis that stands alone should be merged with the following sentence.
-        const sentence = buffer.substring(sentenceStart, boundaryEnd + 1).trim();
+        const sentence = buffer
+          .substring(sentenceStart, boundaryEnd + 1)
+          .trim();
         if (sentence === "..." || sentence === "…") {
           ++i;
           continue;

@@ -29,7 +29,8 @@ const tts = await KokoroTTS.from_pretrained(model_id, {
   device: "wasm", // Options: "wasm", "webgpu" (web) or "cpu" (node). If using "webgpu", we recommend using dtype="fp32".
 });
 
-const text = "Life is like a box of chocolates. You never know what you're gonna get.";
+const text =
+  "Life is like a box of chocolates. You never know what you're gonna get.";
 const audio = await tts.generate(text, {
   // Use `tts.list_voices()` to list all available voices
   voice: "af_heart",
@@ -61,7 +62,8 @@ const stream = tts.stream(splitter);
 
 // Next, add text to the stream. Note that the text can be added at different times.
 // For this example, let's pretend we're consuming text from an LLM, one word at a time.
-const text = "Kokoro is an open-weight TTS model with 82 million parameters. Despite its lightweight architecture, it delivers comparable quality to larger models while being significantly faster and more cost-efficient. With Apache-licensed weights, Kokoro can be deployed anywhere from production environments to personal projects. It can even run 100% locally in your browser, powered by Transformers.js!";
+const text =
+  "Kokoro is an open-weight TTS model with 82 million parameters. Despite its lightweight architecture, it delivers comparable quality to larger models while being significantly faster and more cost-efficient. With Apache-licensed weights, Kokoro can be deployed anywhere from production environments to personal projects. It can even run 100% locally in your browser, powered by Transformers.js!";
 const tokens = text.match(/\s*\S+/g);
 for (const token of tokens) {
   splitter.push(token);

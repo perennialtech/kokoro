@@ -7,7 +7,6 @@ import json
 import re
 import torch
 
-
 ALIASES = {
     "en-us": "a",
     "en-gb": "b",
@@ -61,7 +60,9 @@ class KPipeline:
     ):
         if repo_id is None:
             repo_id = "hexgrad/Kokoro-82M"
-            print(f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning.")
+            print(
+                f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning."
+            )
         self.repo_id = repo_id
 
         if vocab is None or context_length is None:
@@ -69,7 +70,9 @@ class KPipeline:
             with open(config_path, "r", encoding="utf-8") as r:
                 config = json.load(r)
             vocab = vocab or config["vocab"]
-            context_length = context_length or config["plbert"].get("max_position_embeddings", 512)
+            context_length = context_length or config["plbert"].get(
+                "max_position_embeddings", 512
+            )
 
         lang_code = ALIASES.get(lang_code.lower(), lang_code.lower())
         assert lang_code in LANG_CODES, (lang_code, LANG_CODES)
@@ -87,23 +90,31 @@ class KPipeline:
                 logger.warning("EspeakFallback not enabled: OOD words will be skipped")
                 logger.warning(str(e))
                 fallback = None
-            self.g2p = en.G2P(trf=trf, british=lang_code == "b", fallback=fallback, unk="")
+            self.g2p = en.G2P(
+                trf=trf, british=lang_code == "b", fallback=fallback, unk=""
+            )
         elif lang_code == "j":
             try:
                 from misaki import ja
+
                 self.g2p = ja.JAG2P()
             except ImportError:
-                logger.error("You need to `pip install misaki[ja]` to use lang_code='j'")
+                logger.error(
+                    "You need to `pip install misaki[ja]` to use lang_code='j'"
+                )
                 raise
         elif lang_code == "z":
             try:
                 from misaki import zh
+
                 self.g2p = zh.ZHG2P(
                     version=None if repo_id.endswith("/Kokoro-82M") else "1.1",
                     en_callable=en_callable,
                 )
             except ImportError:
-                logger.error("You need to `pip install misaki[zh]` to use lang_code='z'")
+                logger.error(
+                    "You need to `pip install misaki[zh]` to use lang_code='z'"
+                )
                 raise
         else:
             language = LANG_CODES[lang_code]
@@ -115,14 +126,22 @@ class KPipeline:
     def load_single_voice(self, voice: str):
         if voice in self.voices:
             return self.voices[voice]
-        f = voice if voice.endswith(".pt") else hf_hub_download(self.repo_id, filename=f"voices/{voice}.pt")
+        f = (
+            voice
+            if voice.endswith(".pt")
+            else hf_hub_download(self.repo_id, filename=f"voices/{voice}.pt")
+        )
         if not voice.endswith(".pt") and not voice.startswith(self.lang_code):
-            logger.warning(f"Language mismatch, loading {voice} voice into {self.lang_code} pipeline.")
+            logger.warning(
+                f"Language mismatch, loading {voice} voice into {self.lang_code} pipeline."
+            )
         pack = torch.load(f, weights_only=True)
         self.voices[voice] = pack
         return pack
 
-    def load_voice(self, voice: Union[str, torch.FloatTensor], delimiter: str = ",") -> torch.FloatTensor:
+    def load_voice(
+        self, voice: Union[str, torch.FloatTensor], delimiter: str = ","
+    ) -> torch.FloatTensor:
         if isinstance(voice, torch.FloatTensor):
             return voice
         if voice in self.voices:
@@ -136,7 +155,9 @@ class KPipeline:
 
     @staticmethod
     def tokens_to_ps(tokens: List[en.MToken]) -> str:
-        return "".join(t.phonemes + (" " if t.whitespace else "") for t in tokens).strip()
+        return "".join(
+            t.phonemes + (" " if t.whitespace else "") for t in tokens
+        ).strip()
 
     @staticmethod
     def tokens_to_text(tokens: List[en.MToken]) -> str:
@@ -150,7 +171,14 @@ class KPipeline:
         bumps: List[str] = [")", "”"],
     ) -> int:
         for w in waterfall:
-            z = next((i for i, t in reversed(list(enumerate(tokens))) if t.phonemes in set(w)), None)
+            z = next(
+                (
+                    i
+                    for i, t in reversed(list(enumerate(tokens)))
+                    if t.phonemes in set(w)
+                ),
+                None,
+            )
             if z is None:
                 continue
             z += 1
@@ -160,7 +188,9 @@ class KPipeline:
                 return z
         return len(tokens)
 
-    def en_tokenize(self, tokens: List[en.MToken]) -> Generator[Tuple[str, str, List[en.MToken]], None, None]:
+    def en_tokenize(
+        self, tokens: List[en.MToken]
+    ) -> Generator[Tuple[str, str, List[en.MToken]], None, None]:
         tks = []
         pcount = 0
 
@@ -171,7 +201,9 @@ class KPipeline:
 
             if next_pcount > 510:
                 z = KPipeline.waterfall_last(tks, next_pcount)
-                yield KPipeline.tokens_to_text(tks[:z]), KPipeline.tokens_to_ps(tks[:z]), tks[:z]
+                yield KPipeline.tokens_to_text(tks[:z]), KPipeline.tokens_to_ps(
+                    tks[:z]
+                ), tks[:z]
                 tks = tks[z:]
                 pcount = len(KPipeline.tokens_to_ps(tks))
                 if not tks:
@@ -212,7 +244,9 @@ class KPipeline:
         ids = self.phonemes_to_ids(phonemes)
         input_length = len(ids) + 2
         if input_length > self.context_length:
-            raise ValueError(f"Tokenized input too long: {input_length} > {self.context_length}")
+            raise ValueError(
+                f"Tokenized input too long: {input_length} > {self.context_length}"
+            )
 
         bucket = _bucket_for(input_length, self.text_buckets)
         input_ids = torch.zeros((1, bucket), dtype=torch.long)
@@ -270,7 +304,9 @@ class KPipeline:
         if current.strip():
             chunks.append(current.strip())
 
-        return chunks or [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+        return chunks or [
+            text[i : i + chunk_size] for i in range(0, len(text), chunk_size)
+        ]
 
     def prepare(
         self,
@@ -290,13 +326,22 @@ class KPipeline:
                 _, tokens = self.g2p(graphemes)
                 for gs, ps, tks in self.en_tokenize(tokens):
                     if ps:
-                        yield self.prepare_phonemes(gs, ps[:510], voice, speed, tokens=tks, text_index=graphemes_index)
+                        yield self.prepare_phonemes(
+                            gs,
+                            ps[:510],
+                            voice,
+                            speed,
+                            tokens=tks,
+                            text_index=graphemes_index,
+                        )
                 continue
 
             for chunk in self.chunk_non_english_text(graphemes):
                 ps, _ = self.g2p(chunk)
                 if ps:
-                    yield self.prepare_phonemes(chunk, ps[:510], voice, speed, text_index=graphemes_index)
+                    yield self.prepare_phonemes(
+                        chunk, ps[:510], voice, speed, text_index=graphemes_index
+                    )
 
     __call__ = prepare
 

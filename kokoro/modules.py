@@ -10,7 +10,9 @@ class LinearNorm(nn.Module):
     def __init__(self, in_dim, out_dim, bias=True, w_init_gain="linear"):
         super().__init__()
         self.linear_layer = nn.Linear(in_dim, out_dim, bias=bias)
-        nn.init.xavier_uniform_(self.linear_layer.weight, gain=nn.init.calculate_gain(w_init_gain))
+        nn.init.xavier_uniform_(
+            self.linear_layer.weight, gain=nn.init.calculate_gain(w_init_gain)
+        )
 
     def forward(self, x):
         return self.linear_layer(x)
@@ -35,16 +37,24 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(n_symbols, channels)
         padding = (kernel_size - 1) // 2
-        self.cnn = nn.ModuleList([
-            nn.Sequential(
-                weight_norm(nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)),
-                LayerNorm(channels),
-                actv,
-                nn.Dropout(0.2),
-            )
-            for _ in range(depth)
-        ])
-        self.lstm = nn.LSTM(channels, channels // 2, 1, batch_first=True, bidirectional=True)
+        self.cnn = nn.ModuleList(
+            [
+                nn.Sequential(
+                    weight_norm(
+                        nn.Conv1d(
+                            channels, channels, kernel_size=kernel_size, padding=padding
+                        )
+                    ),
+                    LayerNorm(channels),
+                    actv,
+                    nn.Dropout(0.2),
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.lstm = nn.LSTM(
+            channels, channels // 2, 1, batch_first=True, bidirectional=True
+        )
 
     def forward(self, x, input_lengths, m):
         valid = (~m).to(dtype=self.embedding.weight.dtype).unsqueeze(1)
@@ -78,21 +88,35 @@ class AdaLayerNorm(nn.Module):
 class ProsodyPredictor(nn.Module):
     def __init__(self, style_dim, d_hid, nlayers, max_dur=50, dropout=0.1):
         super().__init__()
-        self.text_encoder = DurationEncoder(sty_dim=style_dim, d_model=d_hid, nlayers=nlayers, dropout=dropout)
-        self.lstm = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
+        self.text_encoder = DurationEncoder(
+            sty_dim=style_dim, d_model=d_hid, nlayers=nlayers, dropout=dropout
+        )
+        self.lstm = nn.LSTM(
+            d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True
+        )
         self.duration_proj = LinearNorm(d_hid, max_dur)
-        self.shared = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
+        self.shared = nn.LSTM(
+            d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True
+        )
 
-        self.F0 = nn.ModuleList([
-            AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout),
-            AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout),
-            AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout),
-        ])
-        self.N = nn.ModuleList([
-            AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout),
-            AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout),
-            AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout),
-        ])
+        self.F0 = nn.ModuleList(
+            [
+                AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout),
+                AdainResBlk1d(
+                    d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout
+                ),
+                AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout),
+            ]
+        )
+        self.N = nn.ModuleList(
+            [
+                AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout),
+                AdainResBlk1d(
+                    d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout
+                ),
+                AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout),
+            ]
+        )
         self.F0_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
         self.N_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
 
@@ -127,7 +151,15 @@ class DurationEncoder(nn.Module):
         super().__init__()
         self.lstms = nn.ModuleList()
         for _ in range(nlayers):
-            self.lstms.append(nn.LSTM(d_model + sty_dim, d_model // 2, 1, batch_first=True, bidirectional=True))
+            self.lstms.append(
+                nn.LSTM(
+                    d_model + sty_dim,
+                    d_model // 2,
+                    1,
+                    batch_first=True,
+                    bidirectional=True,
+                )
+            )
             self.lstms.append(AdaLayerNorm(sty_dim, d_model))
         self.dropout = dropout
         self.d_model = d_model
@@ -146,7 +178,10 @@ class DurationEncoder(nn.Module):
             else:
                 block.flatten_parameters()
                 x, _ = block(x.transpose(-1, -2))
-                x = F.dropout(x, p=self.dropout, training=False).transpose(-1, -2) * valid
+                x = (
+                    F.dropout(x, p=self.dropout, training=False).transpose(-1, -2)
+                    * valid
+                )
 
         return x.transpose(-1, -2)
 

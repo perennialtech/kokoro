@@ -3,7 +3,6 @@ import numpy as np
 import pytest
 from kokoro.custom_stft import CustomSTFT
 from kokoro.istftnet import TorchSTFT
-import torch.nn.functional as F
 
 
 @pytest.fixture

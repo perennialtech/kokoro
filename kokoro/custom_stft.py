@@ -47,8 +47,12 @@ class CustomSTFT(nn.Module):
         forward_real = np.cos(angle) * win.numpy()
         forward_imag = -np.sin(angle) * win.numpy()
 
-        self.register_buffer("weight_forward_real", torch.from_numpy(forward_real).float().unsqueeze(1))
-        self.register_buffer("weight_forward_imag", torch.from_numpy(forward_imag).float().unsqueeze(1))
+        self.register_buffer(
+            "weight_forward_real", torch.from_numpy(forward_real).float().unsqueeze(1)
+        )
+        self.register_buffer(
+            "weight_forward_imag", torch.from_numpy(forward_imag).float().unsqueeze(1)
+        )
 
         scale = np.ones(self.freq_bins, dtype=np.float64)
         if self.freq_bins > 2:
@@ -60,8 +64,12 @@ class CustomSTFT(nn.Module):
         inverse_real = np.cos(angle) * inv_scale * win.numpy()
         inverse_imag = -np.sin(angle) * inv_scale * win.numpy()
 
-        self.register_buffer("weight_backward_real", torch.from_numpy(inverse_real).float().unsqueeze(1))
-        self.register_buffer("weight_backward_imag", torch.from_numpy(inverse_imag).float().unsqueeze(1))
+        self.register_buffer(
+            "weight_backward_real", torch.from_numpy(inverse_real).float().unsqueeze(1)
+        )
+        self.register_buffer(
+            "weight_backward_imag", torch.from_numpy(inverse_imag).float().unsqueeze(1)
+        )
         self.register_buffer("weight_window_square", (win * win).view(1, 1, -1))
 
     def transform(self, waveform: torch.Tensor):
@@ -70,7 +78,9 @@ class CustomSTFT(nn.Module):
         elif waveform.dim() == 3 and waveform.shape[1] == 1:
             x = waveform[:, 0, :]
         else:
-            raise ValueError(f"Expected waveform [B,T] or [B,1,T], got {tuple(waveform.shape)}")
+            raise ValueError(
+                f"Expected waveform [B,T] or [B,1,T], got {tuple(waveform.shape)}"
+            )
 
         if self.center:
             pad = self.n_fft // 2
@@ -82,15 +92,21 @@ class CustomSTFT(nn.Module):
 
         magnitude = torch.sqrt(real.square() + imag.square() + 1e-14)
         phase = torch.atan2(imag, real)
-        phase = torch.where((imag == 0) & (real < 0), torch.full_like(phase, torch.pi), phase)
+        phase = torch.where(
+            (imag == 0) & (real < 0), torch.full_like(phase, torch.pi), phase
+        )
         return magnitude, phase
 
     def inverse(self, magnitude: torch.Tensor, phase: torch.Tensor, length=None):
         real = magnitude * torch.cos(phase)
         imag = magnitude * torch.sin(phase)
 
-        waveform = F.conv_transpose1d(real, self.weight_backward_real, stride=self.hop_length)
-        waveform = waveform + F.conv_transpose1d(imag, self.weight_backward_imag, stride=self.hop_length)
+        waveform = F.conv_transpose1d(
+            real, self.weight_backward_real, stride=self.hop_length
+        )
+        waveform = waveform + F.conv_transpose1d(
+            imag, self.weight_backward_imag, stride=self.hop_length
+        )
 
         envelope = F.conv_transpose1d(
             torch.ones_like(magnitude[:, :1, :]),

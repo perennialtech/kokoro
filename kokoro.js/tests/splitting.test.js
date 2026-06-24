@@ -15,7 +15,10 @@ const TESTS = [
   {
     name: "Sentences with quoted speech",
     input: 'She said, "Hello there. How are you?". I replied, "I\'m fine."',
-    target: ['She said, "Hello there. How are you?".', 'I replied, "I\'m fine."'],
+    target: [
+      'She said, "Hello there. How are you?".',
+      'I replied, "I\'m fine."',
+    ],
   },
   {
     name: "Sentences with abbreviations",
@@ -64,8 +67,12 @@ const TESTS = [
   },
   {
     name: "Nested sentences with parentheses",
-    input: "This is an example (This is pretty cool. Another sentence). Do you agree?",
-    target: ["This is an example (This is pretty cool. Another sentence).", "Do you agree?"],
+    input:
+      "This is an example (This is pretty cool. Another sentence). Do you agree?",
+    target: [
+      "This is an example (This is pretty cool. Another sentence).",
+      "Do you agree?",
+    ],
   },
   {
     name: "Sentences with newlines",
@@ -145,7 +152,11 @@ const TESTS = [
   {
     name: "Mixed languages in one line",
     input: "English sentence. 这是一句中文？ Another English sentence!",
-    target: ["English sentence.", "这是一句中文？", "Another English sentence!"],
+    target: [
+      "English sentence.",
+      "这是一句中文？",
+      "Another English sentence!",
+    ],
   },
   {
     name: "Sequence of punctuation plus emoji",
@@ -205,7 +216,10 @@ const TESTS = [
   {
     name: "Sentence with a URL and a period after it",
     input: "You can find more info at https://www.website.com. It’s reliable.",
-    target: ["You can find more info at https://www.website.com.", "It’s reliable."],
+    target: [
+      "You can find more info at https://www.website.com.",
+      "It’s reliable.",
+    ],
   },
   {
     name: "Sentence with multiple hashtags",
@@ -245,7 +259,11 @@ const TESTS = [
   {
     name: "Sentences only containing a quotation",
     input: `"It's not like I'm using," Case heard someone say, as he shouldered his way through the crowd around the door of the Chat. "It's like my body's developed this massive drug deficiency."\nThis is a test.`,
-    target: [`"It's not like I'm using," Case heard someone say, as he shouldered his way through the crowd around the door of the Chat.`, `"It's like my body's developed this massive drug deficiency."`, "This is a test."],
+    target: [
+      `"It's not like I'm using," Case heard someone say, as he shouldered his way through the crowd around the door of the Chat.`,
+      `"It's like my body's developed this massive drug deficiency."`,
+      "This is a test.",
+    ],
   },
   {
     name: "Sentence with a URL containing a question mark",
@@ -274,13 +292,22 @@ const TESTS = [
   },
   {
     name: "Sentence with suffixes and periods",
-    input: "Kokoro.js is powered by Transformers.js, a JavaScript library by Hugging Face.",
-    target: ["Kokoro.js is powered by Transformers.js, a JavaScript library by Hugging Face."],
+    input:
+      "Kokoro.js is powered by Transformers.js, a JavaScript library by Hugging Face.",
+    target: [
+      "Kokoro.js is powered by Transformers.js, a JavaScript library by Hugging Face.",
+    ],
   },
   {
     name: "Non-splitting after a period",
-    input: "Pi is 3.14 i.e., a mathematical constant. J.R.R. Tolkien wrote The Lord of the Rings. Wait... what? The files are /path/to/file.txt, VIDEO.MP4 and image.jpg.",
-    target: ["Pi is 3.14 i.e., a mathematical constant.", "J.R.R. Tolkien wrote The Lord of the Rings.", "Wait... what?", "The files are /path/to/file.txt, VIDEO.MP4 and image.jpg."],
+    input:
+      "Pi is 3.14 i.e., a mathematical constant. J.R.R. Tolkien wrote The Lord of the Rings. Wait... what? The files are /path/to/file.txt, VIDEO.MP4 and image.jpg.",
+    target: [
+      "Pi is 3.14 i.e., a mathematical constant.",
+      "J.R.R. Tolkien wrote The Lord of the Rings.",
+      "Wait... what?",
+      "The files are /path/to/file.txt, VIDEO.MP4 and image.jpg.",
+    ],
   },
   {
     name: "Long text with multiple sentences",
@@ -518,8 +545,12 @@ TESTS.push(
   },
   {
     name: "URL should not split",
-    input: "The site is, https://www.example.50.com/new-site/awesome_content.html. Please check it out.",
-    target: ["The site is, https://www.example.50.com/new-site/awesome_content.html.", "Please check it out."],
+    input:
+      "The site is, https://www.example.50.com/new-site/awesome_content.html. Please check it out.",
+    target: [
+      "The site is, https://www.example.50.com/new-site/awesome_content.html.",
+      "Please check it out.",
+    ],
   },
   // {
   //   name: "Yahoo! should not split",
@@ -546,8 +577,19 @@ TESTS.push(
 const STREAMED_TESTS = [
   {
     name: "Basic sentence splitting",
-    input: ["I went", " to the", " store. I", " bought an apple for $1.", "99. It was", " a good deal."],
-    target: ["I went to the store.", "I bought an apple for $1.99.", "It was a good deal."],
+    input: [
+      "I went",
+      " to the",
+      " store. I",
+      " bought an apple for $1.",
+      "99. It was",
+      " a good deal.",
+    ],
+    target: [
+      "I went to the store.",
+      "I bought an apple for $1.99.",
+      "It was a good deal.",
+    ],
   },
   {
     name: "URL with query parameters",
@@ -622,7 +664,12 @@ describe("Sentence splitting", () => {
       }, 40);
 
       await consumeStream;
-      expect(sentences).toEqual(["Hello, how are you?", "I'm fine, thanks.", "This is a test.", "This is unfinish-ed."]);
+      expect(sentences).toEqual([
+        "Hello, how are you?",
+        "I'm fine, thanks.",
+        "This is a test.",
+        "This is unfinish-ed.",
+      ]);
     });
   });
 
@@ -631,7 +678,11 @@ describe("Sentence splitting", () => {
       // Pre-defined test cases
       ...STREAMED_TESTS,
       // Test that adding character by character (the most extreme case) also works correctly
-      ...TESTS.map(({ name, input, target }) => ({ name, input: Array.from(input), target })),
+      ...TESTS.map(({ name, input, target }) => ({
+        name,
+        input: Array.from(input),
+        target,
+      })),
     ];
     for (const { name, input, target } of tests) {
       test(name, async () => {

@@ -1,7 +1,10 @@
 import terser from "@rollup/plugin-terser";
 import { nodeResolve } from "@rollup/plugin-node-resolve";
 
-const plugins = (browser) => [nodeResolve({ browser }), terser({ format: { comments: false } })];
+const plugins = (browser) => [
+  nodeResolve({ browser }),
+  terser({ format: { comments: false } }),
+];
 
 const OUTPUT_CONFIGS = [
   // Node versions

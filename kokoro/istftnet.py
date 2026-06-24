@@ -30,25 +30,89 @@ class AdaIN1d(nn.Module):
 class AdaINResBlock1(nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64):
         super().__init__()
-        self.convs1 = nn.ModuleList([
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0], padding=get_padding(kernel_size, dilation[0]))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1], padding=get_padding(kernel_size, dilation[1]))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2], padding=get_padding(kernel_size, dilation[2]))),
-        ])
-        self.convs2 = nn.ModuleList([
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1, padding=get_padding(kernel_size, 1))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1, padding=get_padding(kernel_size, 1))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1, padding=get_padding(kernel_size, 1))),
-        ])
+        self.convs1 = nn.ModuleList(
+            [
+                weight_norm(
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation[0],
+                        padding=get_padding(kernel_size, dilation[0]),
+                    )
+                ),
+                weight_norm(
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation[1],
+                        padding=get_padding(kernel_size, dilation[1]),
+                    )
+                ),
+                weight_norm(
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=dilation[2],
+                        padding=get_padding(kernel_size, dilation[2]),
+                    )
+                ),
+            ]
+        )
+        self.convs2 = nn.ModuleList(
+            [
+                weight_norm(
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=1,
+                        padding=get_padding(kernel_size, 1),
+                    )
+                ),
+                weight_norm(
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=1,
+                        padding=get_padding(kernel_size, 1),
+                    )
+                ),
+                weight_norm(
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=1,
+                        padding=get_padding(kernel_size, 1),
+                    )
+                ),
+            ]
+        )
         self.adain1 = nn.ModuleList([AdaIN1d(style_dim, channels) for _ in range(3)])
         self.adain2 = nn.ModuleList([AdaIN1d(style_dim, channels) for _ in range(3)])
-        self.alpha1 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for _ in range(3)])
-        self.alpha2 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for _ in range(3)])
+        self.alpha1 = nn.ParameterList(
+            [nn.Parameter(torch.ones(1, channels, 1)) for _ in range(3)]
+        )
+        self.alpha2 = nn.ParameterList(
+            [nn.Parameter(torch.ones(1, channels, 1)) for _ in range(3)]
+        )
         self.convs1.apply(init_weights)
         self.convs2.apply(init_weights)
 
     def forward(self, x, s):
-        for c1, c2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2):
+        for c1, c2, n1, n2, a1, a2 in zip(
+            self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2
+        ):
             xt = n1(x, s)
             xt = xt + (1 / a1) * torch.sin(a1 * xt).square()
             xt = c1(xt)
@@ -87,7 +151,12 @@ class SineGen(nn.Module):
 
         if not self.flag_for_pulse:
             down_len = max(1, rad_values.shape[1] // self.upsample_scale)
-            rad = F.interpolate(rad_values.transpose(1, 2), size=down_len, mode="linear", align_corners=False).transpose(1, 2)
+            rad = F.interpolate(
+                rad_values.transpose(1, 2),
+                size=down_len,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
             phase = torch.cumsum(rad, dim=1) * 2 * torch.pi
             phase = F.interpolate(
                 (phase.transpose(1, 2) * self.upsample_scale),
@@ -110,7 +179,9 @@ class SineGen(nn.Module):
         return torch.cos(torch.cumsum(rad_values - tmp_cumsum, dim=1) * 2 * torch.pi)
 
     def forward(self, f0):
-        harmonics = torch.arange(1, self.harmonic_num + 2, device=f0.device, dtype=f0.dtype).view(1, 1, -1)
+        harmonics = torch.arange(
+            1, self.harmonic_num + 2, device=f0.device, dtype=f0.dtype
+        ).view(1, 1, -1)
         sine_waves = self._f02sine(f0 * harmonics) * self.sine_amp
         uv = self._f02uv(f0)
         noise = torch.zeros_like(sine_waves)
@@ -118,10 +189,25 @@ class SineGen(nn.Module):
 
 
 class SourceModuleHnNSF(nn.Module):
-    def __init__(self, sampling_rate, upsample_scale, harmonic_num=0, sine_amp=0.1, add_noise_std=0.003, voiced_threshod=0):
+    def __init__(
+        self,
+        sampling_rate,
+        upsample_scale,
+        harmonic_num=0,
+        sine_amp=0.1,
+        add_noise_std=0.003,
+        voiced_threshod=0,
+    ):
         super().__init__()
         self.sine_amp = sine_amp
-        self.l_sin_gen = SineGen(sampling_rate, upsample_scale, harmonic_num, sine_amp, add_noise_std, voiced_threshod)
+        self.l_sin_gen = SineGen(
+            sampling_rate,
+            upsample_scale,
+            harmonic_num,
+            sine_amp,
+            add_noise_std,
+            voiced_threshod,
+        )
         self.l_linear = nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = nn.Tanh()
 
@@ -149,19 +235,25 @@ class Generator(nn.Module):
         self.num_upsamples = len(upsample_rates)
         self.source_upsample_scale = math.prod(upsample_rates) * gen_istft_hop_size
 
-        self.m_source = SourceModuleHnNSF(24000, self.source_upsample_scale, harmonic_num=8, voiced_threshod=10)
+        self.m_source = SourceModuleHnNSF(
+            24000, self.source_upsample_scale, harmonic_num=8, voiced_threshod=10
+        )
         self.noise_convs = nn.ModuleList()
         self.noise_res = nn.ModuleList()
         self.ups = nn.ModuleList()
 
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
-            self.ups.append(weight_norm(nn.ConvTranspose1d(
-                upsample_initial_channel // (2 ** i),
-                upsample_initial_channel // (2 ** (i + 1)),
-                k,
-                u,
-                padding=(k - u) // 2,
-            )))
+            self.ups.append(
+                weight_norm(
+                    nn.ConvTranspose1d(
+                        upsample_initial_channel // (2**i),
+                        upsample_initial_channel // (2 ** (i + 1)),
+                        k,
+                        u,
+                        padding=(k - u) // 2,
+                    )
+                )
+            )
 
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
@@ -171,21 +263,27 @@ class Generator(nn.Module):
 
             c_cur = upsample_initial_channel // (2 ** (i + 1))
             if i + 1 < len(upsample_rates):
-                stride_f0 = math.prod(upsample_rates[i + 1:])
-                self.noise_convs.append(nn.Conv1d(
-                    gen_istft_n_fft + 2,
-                    c_cur,
-                    kernel_size=stride_f0 * 2,
-                    stride=stride_f0,
-                    padding=(stride_f0 + 1) // 2,
-                ))
+                stride_f0 = math.prod(upsample_rates[i + 1 :])
+                self.noise_convs.append(
+                    nn.Conv1d(
+                        gen_istft_n_fft + 2,
+                        c_cur,
+                        kernel_size=stride_f0 * 2,
+                        stride=stride_f0,
+                        padding=(stride_f0 + 1) // 2,
+                    )
+                )
                 self.noise_res.append(AdaINResBlock1(c_cur, 7, [1, 3, 5], style_dim))
             else:
-                self.noise_convs.append(nn.Conv1d(gen_istft_n_fft + 2, c_cur, kernel_size=1))
+                self.noise_convs.append(
+                    nn.Conv1d(gen_istft_n_fft + 2, c_cur, kernel_size=1)
+                )
                 self.noise_res.append(AdaINResBlock1(c_cur, 11, [1, 3, 5], style_dim))
 
         self.post_n_fft = gen_istft_n_fft
-        self.conv_post = weight_norm(nn.Conv1d(ch, self.post_n_fft + 2, 7, 1, padding=3))
+        self.conv_post = weight_norm(
+            nn.Conv1d(ch, self.post_n_fft + 2, 7, 1, padding=3)
+        )
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
         self.stft = CustomSTFT(gen_istft_n_fft, gen_istft_hop_size, gen_istft_n_fft)
         self.ups.apply(init_weights)
@@ -236,7 +334,15 @@ class UpSample1d(nn.Module):
 
 
 class AdainResBlk1d(nn.Module):
-    def __init__(self, dim_in, dim_out, style_dim=64, actv=nn.LeakyReLU(0.2), upsample="none", dropout_p=0.0):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        style_dim=64,
+        actv=nn.LeakyReLU(0.2),
+        upsample="none",
+        dropout_p=0.0,
+    ):
         super().__init__()
         self.actv = actv
         self.upsample_type = upsample
@@ -252,8 +358,20 @@ class AdainResBlk1d(nn.Module):
         if self.learned_sc:
             self.conv1x1 = weight_norm(nn.Conv1d(dim_in, dim_out, 1, 1, 0, bias=False))
 
-        self.pool = nn.Identity() if upsample == "none" else weight_norm(
-            nn.ConvTranspose1d(dim_in, dim_in, kernel_size=3, stride=2, groups=dim_in, padding=1, output_padding=1)
+        self.pool = (
+            nn.Identity()
+            if upsample == "none"
+            else weight_norm(
+                nn.ConvTranspose1d(
+                    dim_in,
+                    dim_in,
+                    kernel_size=3,
+                    stride=2,
+                    groups=dim_in,
+                    padding=1,
+                    output_padding=1,
+                )
+            )
         )
 
     def _shortcut(self, x):
@@ -287,14 +405,20 @@ class Decoder(nn.Module):
     ):
         super().__init__()
         self.encode = AdainResBlk1d(dim_in + 2, 1024, style_dim)
-        self.decode = nn.ModuleList([
-            AdainResBlk1d(1024 + 2 + 64, 1024, style_dim),
-            AdainResBlk1d(1024 + 2 + 64, 1024, style_dim),
-            AdainResBlk1d(1024 + 2 + 64, 1024, style_dim),
-            AdainResBlk1d(1024 + 2 + 64, 512, style_dim, upsample=True),
-        ])
-        self.F0_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
-        self.N_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
+        self.decode = nn.ModuleList(
+            [
+                AdainResBlk1d(1024 + 2 + 64, 1024, style_dim),
+                AdainResBlk1d(1024 + 2 + 64, 1024, style_dim),
+                AdainResBlk1d(1024 + 2 + 64, 1024, style_dim),
+                AdainResBlk1d(1024 + 2 + 64, 512, style_dim, upsample=True),
+            ]
+        )
+        self.F0_conv = weight_norm(
+            nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1)
+        )
+        self.N_conv = weight_norm(
+            nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1)
+        )
         self.asr_res = nn.Sequential(weight_norm(nn.Conv1d(512, 64, kernel_size=1)))
         self.generator = Generator(
             style_dim,
@@ -324,7 +448,9 @@ class Decoder(nn.Module):
         return x
 
     def forward_with_har(self, asr, F0_curve, N, s, har):
-        return self.generator.forward_with_har(self.decode_features(asr, F0_curve, N, s), s, har)
+        return self.generator.forward_with_har(
+            self.decode_features(asr, F0_curve, N, s), s, har
+        )
 
     def forward(self, asr, F0_curve, N, s):
         return self.generator(self.decode_features(asr, F0_curve, N, s), s, F0_curve)
