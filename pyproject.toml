@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kokoro"
-version = "0.9.4"
+version = "0.10.0"
 description = "TTS"
 readme = "README.md"
 authors = [
