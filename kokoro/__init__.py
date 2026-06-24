@@ -14,9 +14,11 @@ logger.disable("kokoro")
 
 from .model import (
     KModel,
+    KModelOutput,
     KokoroAcousticVocoder,
     KokoroInferenceBackend,
     KokoroTextDuration,
+    UtteranceOutput,
     expand_token_features,
 )
 from .onnx import KONNXModel, KokoroONNXBackend

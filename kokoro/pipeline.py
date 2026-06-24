@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
 from misaki import en, espeak
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Generator, List, Optional, Tuple, Union
 import json
 import re
 import torch
@@ -32,20 +32,13 @@ LANG_CODES = {
 }
 
 
-def _bucket_for(length: int, buckets: Sequence[int]) -> int:
-    for b in sorted(buckets):
-        if length <= b:
-            return b
-    raise ValueError(f"Length {length} exceeds largest bucket {max(buckets)}")
-
-
 class KPipeline:
     """
     Host text frontend.
 
     This class performs text/G2P/chunking/vocab lookup/voice selection and
-    returns numeric tensors suitable for KokoroTextDuration. It does not own or
-    execute the neural inference backend.
+    returns exact-length numeric tensors suitable for KokoroTextDuration. It does
+    not own or execute the neural inference backend.
     """
 
     def __init__(
@@ -54,7 +47,6 @@ class KPipeline:
         repo_id: Optional[str] = None,
         vocab: Optional[dict[str, int]] = None,
         context_length: Optional[int] = None,
-        text_buckets: Sequence[int] = (64, 128, 256, 512),
         trf: bool = False,
         en_callable: Optional[Callable[[str], str]] = None,
     ):
@@ -82,14 +74,18 @@ class KPipeline:
 
         if vocab is None or context_length is None:
             raise ValueError("vocab and context_length are required")
+        if context_length <= 2:
+            raise ValueError(
+                f"context_length must be greater than 2, got {context_length}"
+            )
 
         lang_code = ALIASES.get(lang_code.lower(), lang_code.lower())
         assert lang_code in LANG_CODES, (lang_code, LANG_CODES)
 
         self.lang_code = lang_code
         self.vocab: dict[str, int] = vocab
-        self.context_length: int = context_length
-        self.text_buckets = tuple(text_buckets)
+        self.context_length: int = int(context_length)
+        self.max_phoneme_len: int = self.context_length - 2
         self.voices: dict[str, torch.Tensor] = {}
 
         if lang_code in "ab":
@@ -146,7 +142,6 @@ class KPipeline:
             )
         pack = torch.load(f, weights_only=True)
 
-        # Enforce exactly 2 dimensions [sequence_length, channels] for the loaded style vector
         if len(pack.shape) == 1:
             pack = pack.unsqueeze(0)
         elif len(pack.shape) > 2:
@@ -179,8 +174,14 @@ class KPipeline:
     def tokens_to_text(tokens: List[en.MToken]) -> str:
         return "".join(t.text + t.whitespace for t in tokens).strip()
 
-    @staticmethod
+    def phonemes_to_ids(self, phonemes: str) -> List[int]:
+        return [self.vocab[p] for p in phonemes if self.vocab.get(p) is not None]
+
+    def phoneme_id_count(self, phonemes: str) -> int:
+        return sum(1 for p in phonemes if self.vocab.get(p) is not None)
+
     def waterfall_last(
+        self,
         tokens: List[en.MToken],
         next_count: int,
         waterfall: List[str] = ["!.?…", ":;", ",—"],
@@ -200,49 +201,60 @@ class KPipeline:
             z += 1
             if z < len(tokens) and tokens[z].phonemes in bumps:
                 z += 1
-            if next_count - len(KPipeline.tokens_to_ps(tokens[:z])) <= 510:
+            yielded_count = self.phoneme_id_count(KPipeline.tokens_to_ps(tokens[:z]))
+            if next_count - yielded_count <= self.max_phoneme_len:
                 return z
         return len(tokens)
 
     def en_tokenize(
         self, tokens: List[en.MToken]
     ) -> Generator[Tuple[str, str, List[en.MToken]], None, None]:
-        tks = []
-        pcount = 0
+        tks: List[en.MToken] = []
 
         for t in tokens:
-            phonemes = t.phonemes or ""
-            t.phonemes = phonemes
-            next_ps = phonemes + (" " if t.whitespace else "")
-            next_pcount = pcount + len(next_ps.rstrip())
+            t.phonemes = t.phonemes or ""
+            next_count = self.phoneme_id_count(KPipeline.tokens_to_ps([*tks, t]))
 
-            if next_pcount > 510:
-                z = KPipeline.waterfall_last(tks, next_pcount)
+            if next_count > self.max_phoneme_len and tks:
+                z = self.waterfall_last(tks, next_count)
                 yield KPipeline.tokens_to_text(tks[:z]), KPipeline.tokens_to_ps(
                     tks[:z]
                 ), tks[:z]
                 tks = tks[z:]
-                pcount = len(KPipeline.tokens_to_ps(tks))
-                if not tks:
-                    next_ps = next_ps.lstrip()
 
             tks.append(t)
-            pcount += len(next_ps)
 
         if tks:
             yield KPipeline.tokens_to_text(tks), KPipeline.tokens_to_ps(tks), tks
 
-    def phonemes_to_ids(self, phonemes: str) -> List[int]:
-        return [self.vocab[p] for p in phonemes if self.vocab.get(p) is not None]
+    def split_phonemes_to_context(self, phonemes: str) -> Generator[str, None, None]:
+        current: list[str] = []
+        count = 0
+
+        for p in phonemes:
+            increment = 1 if self.vocab.get(p) is not None else 0
+            if count + increment > self.max_phoneme_len and current:
+                chunk = "".join(current).strip()
+                if chunk:
+                    yield chunk
+                current = []
+                count = 0
+
+            current.append(p)
+            count += increment
+
+        chunk = "".join(current).strip()
+        if chunk:
+            yield chunk
 
     @dataclass
     class PreparedInput:
         graphemes: str
         phonemes: str
         input_ids: torch.Tensor
-        input_lengths: torch.Tensor
+        input_length: int
         ref_s: torch.Tensor
-        speed: torch.Tensor
+        speed: float
         tokens: Optional[List[en.MToken]] = None
         text_index: Optional[int] = None
 
@@ -259,15 +271,13 @@ class KPipeline:
             raise ValueError("Cannot prepare empty phoneme string")
 
         ids = self.phonemes_to_ids(phonemes)
-        input_length = len(ids) + 2
-        if input_length > self.context_length:
+        if len(ids) > self.max_phoneme_len:
             raise ValueError(
-                f"Tokenized input too long: {input_length} > {self.context_length}"
+                f"Tokenized phoneme payload too long: {len(ids)} > {self.max_phoneme_len}"
             )
 
-        bucket = _bucket_for(input_length, self.text_buckets)
-        input_ids = torch.zeros((1, bucket), dtype=torch.long)
-        input_ids[0, :input_length] = torch.tensor([0, *ids, 0], dtype=torch.long)
+        input_ids = torch.tensor([0, *ids, 0], dtype=torch.long)
+        input_length = int(input_ids.numel())
 
         pack = self.load_voice(voice).float()
         ref_index = min(len(phonemes) - 1, pack.shape[0] - 1)
@@ -279,9 +289,9 @@ class KPipeline:
             tokens=tokens,
             text_index=text_index,
             input_ids=input_ids,
-            input_lengths=torch.tensor([input_length], dtype=torch.long),
-            ref_s=pack[ref_index].unsqueeze(0),
-            speed=torch.tensor([speed_value], dtype=torch.float32),
+            input_length=input_length,
+            ref_s=pack[ref_index],
+            speed=float(speed_value),
         )
 
     def prepare_from_tokens(
@@ -291,14 +301,16 @@ class KPipeline:
         speed: Union[float, Callable[[int], float]] = 1,
     ) -> Generator["KPipeline.PreparedInput", None, None]:
         if isinstance(tokens, str):
-            if len(tokens) > 510:
-                raise ValueError(f"Phoneme string too long: {len(tokens)} > 510")
+            if self.phoneme_id_count(tokens) > self.max_phoneme_len:
+                raise ValueError(
+                    f"Phoneme payload too long: {self.phoneme_id_count(tokens)} > {self.max_phoneme_len}"
+                )
             yield self.prepare_phonemes("", tokens, voice, speed)
             return
 
         for gs, ps, tks in self.en_tokenize(tokens):
             if ps:
-                yield self.prepare_phonemes(gs, ps[:510], voice, speed, tokens=tks)
+                yield self.prepare_phonemes(gs, ps, voice, speed, tokens=tks)
 
     @staticmethod
     def chunk_non_english_text(text: str, chunk_size: int = 400) -> List[str]:
@@ -347,7 +359,7 @@ class KPipeline:
                     if ps:
                         yield self.prepare_phonemes(
                             gs,
-                            ps[:510],
+                            ps,
                             voice,
                             speed,
                             tokens=tks,
@@ -357,10 +369,15 @@ class KPipeline:
 
             for chunk in self.chunk_non_english_text(graphemes):
                 ps, _ = self.g2p(chunk)
-                if ps:
-                    yield self.prepare_phonemes(
-                        chunk, ps[:510], voice, speed, text_index=graphemes_index
-                    )
+                for ps_chunk in self.split_phonemes_to_context(ps):
+                    if ps_chunk:
+                        yield self.prepare_phonemes(
+                            chunk,
+                            ps_chunk,
+                            voice,
+                            speed,
+                            text_index=graphemes_index,
+                        )
 
     __call__ = prepare
 

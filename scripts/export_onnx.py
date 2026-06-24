@@ -14,8 +14,7 @@ def export_kokoro_to_onnx():
     print("\nExport successful! Created the following files:")
     for prefix, files in paths.items():
         print(f"\n{prefix}:")
-        for f in files:
-            print(f"  - {f}")
+        print(f"  - {files}")
 
 
 if __name__ == "__main__":

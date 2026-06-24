@@ -1,7 +1,7 @@
 from .istftnet import AdainResBlk1d
 from torch.nn.utils.parametrizations import weight_norm
 from transformers import AlbertModel
-from typing import Literal, TypeAlias
+from typing import Literal, Optional, TypeAlias
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +20,51 @@ Nonlinearity: TypeAlias = Literal[
     "conv_transpose2d",
     "conv_transpose3d",
 ]
+
+
+def run_length_aware_lstm(
+    lstm: nn.LSTM,
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+    total_length: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Run an LSTM only over each item's valid prefix.
+
+    Input shape is [B, T, C]. Output shape is [B, T, H], padded positions zeroed.
+    Valid outputs are invariant to extra padded timesteps.
+    """
+    if x.dim() != 3:
+        raise ValueError(f"Expected LSTM input [B,T,C], got {tuple(x.shape)}")
+
+    total_length = x.shape[1] if total_length is None else total_length
+    mask_lengths = lengths.to(device=x.device, dtype=torch.long).clamp(
+        min=0, max=total_length
+    )
+
+    if getattr(torch.compiler, "is_compiling", lambda: False)():
+        y, _ = lstm(x)
+    else:
+        pack_lengths = mask_lengths.clamp(min=1).detach().to("cpu")
+
+        lstm.flatten_parameters()
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x,
+            pack_lengths,
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        packed_out, _ = lstm(packed)
+        y, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out,
+            batch_first=True,
+            total_length=total_length,
+        )
+
+    mask = torch.arange(total_length, device=x.device).unsqueeze(
+        0
+    ) < mask_lengths.unsqueeze(1)
+    return y * mask.unsqueeze(-1).to(y.dtype)
 
 
 class LinearNorm(nn.Module):
@@ -84,8 +129,12 @@ class TextEncoder(nn.Module):
         for c in self.cnn:
             x = c(x) * valid
         x = x.transpose(1, 2)
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
+        x = run_length_aware_lstm(
+            self.lstm,
+            x,
+            input_lengths,
+            total_length=x.shape[1],
+        )
         return x.transpose(-1, -2) * valid
 
 
@@ -144,15 +193,35 @@ class ProsodyPredictor(nn.Module):
 
     def forward(self, texts, style, text_lengths, alignment, m):
         d = self.text_encoder(texts, style, text_lengths, m)
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(d)
+        x = run_length_aware_lstm(
+            self.lstm,
+            d,
+            text_lengths,
+            total_length=d.shape[1],
+        )
         duration = self.duration_proj(F.dropout(x, 0.5, training=False))
+
+        mask = torch.arange(d.shape[1], device=d.device).unsqueeze(
+            0
+        ) < text_lengths.unsqueeze(1)
+        duration = duration * mask.unsqueeze(-1).to(duration.dtype)
+
         en = d.transpose(-1, -2) @ alignment
         return duration.squeeze(-1), en
 
-    def F0Ntrain(self, x, s):
-        self.shared.flatten_parameters()
-        x, _ = self.shared(x.transpose(-1, -2))
+    def F0Ntrain(self, x, s, lengths: Optional[torch.Tensor] = None):
+        x = x.transpose(-1, -2)
+        if lengths is None:
+            if not getattr(torch.compiler, "is_compiling", lambda: False)():
+                self.shared.flatten_parameters()
+            x, _ = self.shared(x)
+        else:
+            x = run_length_aware_lstm(
+                self.shared,
+                x,
+                lengths,
+                total_length=x.shape[1],
+            )
         x = x.transpose(-1, -2)
 
         f0 = x
@@ -198,10 +267,15 @@ class DurationEncoder(nn.Module):
                 style_time = style.unsqueeze(-1).expand(-1, -1, x.shape[-1])
                 x = torch.cat([x, style_time], dim=1) * valid
             elif isinstance(block, nn.LSTM):
-                block.flatten_parameters()
-                x, _ = block(x.transpose(-1, -2))
+                x_time = x.transpose(-1, -2)
+                x_time = run_length_aware_lstm(
+                    block,
+                    x_time,
+                    text_lengths,
+                    total_length=x_time.shape[1],
+                )
                 x = (
-                    F.dropout(x, p=self.dropout, training=False).transpose(-1, -2)
+                    F.dropout(x_time, p=self.dropout, training=False).transpose(-1, -2)
                     * valid
                 )
 

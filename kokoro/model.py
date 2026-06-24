@@ -1,21 +1,24 @@
-from .istftnet import Decoder
-from .modules import CustomAlbert, ProsodyPredictor, TextEncoder
+import json
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional, Union
+
+import torch
 from huggingface_hub import hf_hub_download
 from loguru import logger
-from pathlib import Path
 from torch.nn.utils import parametrize
 from transformers import AlbertConfig
-from typing import Any, Optional, Sequence, Union
-import json
-import torch
+
+from .istftnet import Decoder
+from .modules import CustomAlbert, ProsodyPredictor, TextEncoder, run_length_aware_lstm
 
 DEFAULT_REPO_ID = "hexgrad/Kokoro-82M"
-DEFAULT_TEXT_BUCKETS = (64, 128, 256, 512)
-DEFAULT_FRAME_BUCKETS = (128, 256, 512, 1024, 2048, 4096)
 
 ONNX_TEXT_DURATION_PREFIX = "text_duration"
 ONNX_ACOUSTIC_VOCODER_PREFIX = "acoustic_vocoder"
+
+END_SILENCE_FRAMES = 5
+KEEP_EOS_FRAMES = 1
 
 
 def resolve_repo_id(repo_id: Optional[str]) -> str:
@@ -42,8 +45,8 @@ def load_config_data(
         return json.load(r)
 
 
-def onnx_export_path(output_dir: Union[str, Path], prefix: str, bucket: int) -> Path:
-    return Path(output_dir) / f"{prefix}_{bucket}.onnx"
+def onnx_export_path(output_dir: Union[str, Path], prefix: str) -> Path:
+    return Path(output_dir) / f"{prefix}.onnx"
 
 
 def remove_weight_norm_parametrizations(module: torch.nn.Module) -> None:
@@ -52,20 +55,149 @@ def remove_weight_norm_parametrizations(module: torch.nn.Module) -> None:
             parametrize.remove_parametrizations(m, "weight", leave_parametrized=True)
 
 
-def _bucket_for(length: int, buckets: Sequence[int]) -> int:
-    for b in sorted(buckets):
-        if length <= b:
-            return b
-    raise ValueError(f"Length {length} exceeds largest bucket {max(buckets)}")
+@dataclass
+class FrameItem:
+    asr: torch.Tensor
+    en: torch.Tensor
+    pred_dur: torch.Tensor
+    synthesis_frame_length: int
+    return_frame_length: int
 
 
 @dataclass
 class FrameExpansion:
-    asr: torch.Tensor
-    en: torch.Tensor
-    frame_lengths: torch.Tensor
+    items: list[FrameItem]
+
+
+@dataclass
+class UtteranceOutput:
+    audio: torch.Tensor
     pred_dur: torch.Tensor
-    frame_bucket: int
+    duration_float: torch.Tensor
+    synthesis_frame_length: int
+    return_frame_length: int
+    sample_length: int
+    graphemes: Optional[str] = None
+    phonemes: Optional[str] = None
+
+
+@dataclass
+class KModelOutput:
+    utterances: list[UtteranceOutput]
+
+    def to_padded_audio(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.utterances:
+            return torch.empty((0, 0)), torch.empty((0,), dtype=torch.long)
+
+        sample_lengths = torch.tensor(
+            [u.sample_length for u in self.utterances],
+            dtype=torch.long,
+            device=self.utterances[0].audio.device,
+        )
+        max_len = int(sample_lengths.max().item())
+        audio = self.utterances[0].audio.new_zeros((len(self.utterances), max_len))
+
+        for i, utterance in enumerate(self.utterances):
+            audio[i, : utterance.sample_length] = utterance.audio[
+                : utterance.sample_length
+            ]
+
+        return audio, sample_lengths
+
+
+@dataclass
+class InferenceBatch:
+    input_ids: torch.Tensor
+    input_lengths: torch.Tensor
+    ref_s: torch.Tensor
+    speed: torch.Tensor
+    graphemes: list[Optional[str]]
+    phonemes: list[Optional[str]]
+
+
+def normalize_inference_inputs(
+    input_ids: Optional[torch.Tensor] = None,
+    input_lengths: Optional[torch.Tensor] = None,
+    ref_s: Optional[torch.Tensor] = None,
+    speed: Optional[torch.Tensor] = None,
+    prepared=None,
+    device: Optional[torch.device] = None,
+) -> InferenceBatch:
+    if prepared is not None:
+        input_ids = prepared.input_ids
+        input_lengths = torch.tensor([int(prepared.input_length)], dtype=torch.long)
+        ref_s = prepared.ref_s
+        speed = torch.tensor([float(prepared.speed)], dtype=torch.float32)
+        graphemes = [getattr(prepared, "graphemes", None)]
+        phonemes = [getattr(prepared, "phonemes", None)]
+    else:
+        graphemes = []
+        phonemes = []
+
+    if input_ids is None or ref_s is None or speed is None:
+        raise ValueError(
+            "input_ids, ref_s, and speed are required unless prepared is provided"
+        )
+
+    if not isinstance(input_ids, torch.Tensor):
+        input_ids = torch.as_tensor(input_ids, dtype=torch.long)
+    else:
+        input_ids = input_ids.to(dtype=torch.long)
+
+    if input_lengths is None:
+        if input_ids.dim() == 1:
+            input_lengths = torch.tensor([input_ids.shape[0]], dtype=torch.long)
+        elif input_ids.dim() == 2:
+            input_lengths = torch.full(
+                (input_ids.shape[0],), input_ids.shape[1], dtype=torch.long
+            )
+        else:
+            raise ValueError(
+                f"Expected input_ids [T] or [B,T], got {tuple(input_ids.shape)}"
+            )
+    elif not isinstance(input_lengths, torch.Tensor):
+        input_lengths = torch.as_tensor(input_lengths, dtype=torch.long)
+    else:
+        input_lengths = input_lengths.to(dtype=torch.long)
+
+    if not isinstance(ref_s, torch.Tensor):
+        ref_s = torch.as_tensor(ref_s, dtype=torch.float32)
+    else:
+        ref_s = ref_s.to(dtype=torch.float32)
+
+    if not isinstance(speed, torch.Tensor):
+        speed = torch.as_tensor(speed, dtype=torch.float32)
+    else:
+        speed = speed.to(dtype=torch.float32)
+
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    if input_lengths.dim() == 0:
+        input_lengths = input_lengths.unsqueeze(0)
+    if ref_s.dim() == 1:
+        ref_s = ref_s.unsqueeze(0)
+    if speed.dim() == 0:
+        speed = speed.unsqueeze(0)
+
+    batch_size = input_ids.shape[0]
+    if not graphemes:
+        graphemes = [None] * batch_size
+        phonemes = [None] * batch_size
+
+    if device is not None:
+        input_ids = input_ids.to(device)
+        input_lengths = input_lengths.to(device)
+        ref_s = ref_s.to(device)
+        speed = speed.to(device)
+
+    return InferenceBatch(
+        input_ids=input_ids,
+        input_lengths=input_lengths,
+        ref_s=ref_s,
+        speed=speed,
+        graphemes=graphemes,
+        phonemes=phonemes,
+    )
 
 
 def expand_token_features(
@@ -73,47 +205,44 @@ def expand_token_features(
     duration_hidden: torch.Tensor,
     text_hidden: torch.Tensor,
     input_lengths: torch.Tensor,
-    frame_buckets: Sequence[int] = DEFAULT_FRAME_BUCKETS,
+    end_silence_frames: int = END_SILENCE_FRAMES,
+    keep_eos_frames: int = KEEP_EOS_FRAMES,
 ) -> FrameExpansion:
-    """
-    Host-side duration rounding and token-to-frame expansion.
-
-    duration_float: [B,T]
-    duration_hidden: [B,T,H_en]
-    text_hidden: [B,T,H_asr]
-    input_lengths: [B]
-    """
     device = duration_float.device
-    batch, text_bucket = duration_float.shape
-    pred_dur = torch.zeros((batch, text_bucket), dtype=torch.long, device=device)
-    totals = []
+    batch = duration_float.shape[0]
+    items: list[FrameItem] = []
 
     for b in range(batch):
         n = int(input_lengths[b].item())
+        if n <= 0:
+            raise ValueError("input_lengths must be positive")
+
         d = torch.round(duration_float[b, :n]).clamp(min=1).long()
-        pred_dur[b, :n] = d
-        totals.append(int(d.sum().item()))
 
-    frame_bucket = _bucket_for(max(totals), frame_buckets)
-    asr_channels = text_hidden.shape[-1]
-    en_channels = duration_hidden.shape[-1]
-    asr = text_hidden.new_zeros((batch, asr_channels, frame_bucket))
-    en = duration_hidden.new_zeros((batch, en_channels, frame_bucket))
+        if end_silence_frames > 0:
+            d[-1] += end_silence_frames
 
-    for b in range(batch):
-        n = int(input_lengths[b].item())
-        idx = torch.repeat_interleave(torch.arange(n, device=device), pred_dur[b, :n])
-        total = idx.numel()
-        asr[b, :, :total] = text_hidden[b, idx, :].transpose(0, 1)
-        en[b, :, :total] = duration_hidden[b, idx, :].transpose(0, 1)
+        idx = torch.repeat_interleave(torch.arange(n, device=device), d)
+        synthesis_frame_length = int(idx.numel())
 
-    return FrameExpansion(
-        asr=asr,
-        en=en,
-        frame_lengths=torch.tensor(totals, dtype=torch.long, device=device),
-        pred_dur=pred_dur,
-        frame_bucket=frame_bucket,
-    )
+        asr = text_hidden[b, idx, :].transpose(0, 1).contiguous()
+        en = duration_hidden[b, idx, :].transpose(0, 1).contiguous()
+
+        eos_frames = int(d[-1].item())
+        trim_frames = max(eos_frames - keep_eos_frames, 0)
+        return_frame_length = max(1, synthesis_frame_length - trim_frames)
+
+        items.append(
+            FrameItem(
+                asr=asr,
+                en=en,
+                pred_dur=d,
+                synthesis_frame_length=synthesis_frame_length,
+                return_frame_length=return_frame_length,
+            )
+        )
+
+    return FrameExpansion(items=items)
 
 
 class KokoroTextDuration(torch.nn.Module):
@@ -150,8 +279,12 @@ class KokoroTextDuration(torch.nn.Module):
             d_en, duration_style, input_lengths, text_mask
         )
 
-        self.predictor.lstm.flatten_parameters()
-        x, _ = self.predictor.lstm(duration_hidden)
+        x = run_length_aware_lstm(
+            self.predictor.lstm,
+            duration_hidden,
+            input_lengths,
+            total_length=duration_hidden.shape[1],
+        )
         duration = torch.sigmoid(self.predictor.duration_proj(x)).sum(dim=-1)
         duration = duration / speed.reshape(-1, 1).to(duration.dtype)
         duration = duration * valid
@@ -165,16 +298,20 @@ class KokoroTextDuration(torch.nn.Module):
         return duration, duration_hidden, text_hidden
 
     def export_onnx(
-        self, path: str, batch_size: int = 1, text_bucket: int = 512, opset: int = 18
+        self,
+        path: str,
+        example_text_length: int = 64,
+        opset: int = 18,
     ):
         self.eval()
         device = next(self.parameters()).device
         args = (
-            torch.zeros((batch_size, text_bucket), dtype=torch.long, device=device),
-            torch.full((batch_size,), text_bucket, dtype=torch.long, device=device),
-            torch.zeros((batch_size, 256), dtype=torch.float32, device=device),
-            torch.ones((batch_size,), dtype=torch.float32, device=device),
+            torch.zeros((1, example_text_length), dtype=torch.long, device=device),
+            torch.full((1,), example_text_length, dtype=torch.long, device=device),
+            torch.zeros((1, 256), dtype=torch.float32, device=device),
+            torch.ones((1,), dtype=torch.float32, device=device),
         )
+        text_len = torch.export.Dim("text_len", min=1)
         torch.onnx.export(
             self,
             args,
@@ -183,6 +320,18 @@ class KokoroTextDuration(torch.nn.Module):
             output_names=["duration_float", "duration_hidden", "text_hidden"],
             opset_version=opset,
             dynamo=True,
+            dynamic_shapes={
+                "input_ids": {1: text_len},
+                "input_lengths": {},
+                "ref_s": {},
+                "speed": {},
+            },
+            dynamic_axes={
+                "input_ids": {1: "text_len"},
+                "duration_float": {1: "text_len"},
+                "duration_hidden": {1: "text_len"},
+                "text_hidden": {1: "text_len"},
+            },
         )
 
 
@@ -219,25 +368,25 @@ class KokoroAcousticVocoder(torch.nn.Module):
     def export_onnx(
         self,
         path: str,
-        batch_size: int = 1,
-        frame_bucket: int = 512,
+        example_frame_length: int = 128,
         opset: int = 18,
     ):
         self.eval()
         device = next(self.parameters()).device
         args = (
             torch.zeros(
-                (batch_size, self.asr_channels, frame_bucket),
+                (1, self.asr_channels, example_frame_length),
                 dtype=torch.float32,
                 device=device,
             ),
             torch.zeros(
-                (batch_size, self.en_channels, frame_bucket),
+                (1, self.en_channels, example_frame_length),
                 dtype=torch.float32,
                 device=device,
             ),
-            torch.zeros((batch_size, 256), dtype=torch.float32, device=device),
+            torch.zeros((1, 256), dtype=torch.float32, device=device),
         )
+        frame_len = torch.export.Dim("frame_len", min=1)
         torch.onnx.export(
             self,
             args,
@@ -246,19 +395,24 @@ class KokoroAcousticVocoder(torch.nn.Module):
             output_names=["waveform"],
             opset_version=opset,
             dynamo=True,
+            dynamic_shapes={
+                "asr": {2: frame_len},
+                "en": {2: frame_len},
+                "ref_s": {},
+            },
+            dynamic_axes={
+                "asr": {2: "frame_len"},
+                "en": {2: "frame_len"},
+                "waveform": {2: "sample_len"},
+            },
         )
 
 
 class KokoroInferenceBackend:
-    def __init__(
-        self,
-        kmodel: "KModel",
-        frame_buckets: Sequence[int] = DEFAULT_FRAME_BUCKETS,
-    ):
+    def __init__(self, kmodel: "KModel"):
         self.kmodel = kmodel.eval()
         self.text_duration = KokoroTextDuration(kmodel).eval()
         self.acoustic_vocoder = KokoroAcousticVocoder(kmodel).eval()
-        self.frame_buckets = tuple(frame_buckets)
 
     @torch.no_grad()
     def __call__(
@@ -268,57 +422,66 @@ class KokoroInferenceBackend:
         ref_s: Optional[torch.Tensor] = None,
         speed: Optional[torch.Tensor] = None,
         prepared=None,
-    ) -> "KModel.Output":
-        if prepared is not None:
-            input_ids = prepared.input_ids
-            input_lengths = prepared.input_lengths
-            ref_s = prepared.ref_s
-            speed = prepared.speed
-
-        if input_ids is None or input_lengths is None or ref_s is None or speed is None:
-            raise ValueError(
-                "input_ids, input_lengths, ref_s, and speed are required "
-                "unless prepared is provided"
-            )
-
-        device = self.kmodel.device
-        input_ids = input_ids.to(device)
-        input_lengths = input_lengths.to(device)
-        ref_s = ref_s.to(device)
-        speed = speed.to(device)
+    ) -> KModelOutput:
+        batch = normalize_inference_inputs(
+            input_ids=input_ids,
+            input_lengths=input_lengths,
+            ref_s=ref_s,
+            speed=speed,
+            prepared=prepared,
+            device=self.kmodel.device,
+        )
 
         duration_float, duration_hidden, text_hidden = self.text_duration(
-            input_ids, input_lengths, ref_s, speed
+            batch.input_ids,
+            batch.input_lengths,
+            batch.ref_s,
+            batch.speed,
         )
         frames = expand_token_features(
             duration_float,
             duration_hidden,
             text_hidden,
-            input_lengths,
-            self.frame_buckets,
+            batch.input_lengths,
+            end_silence_frames=END_SILENCE_FRAMES,
+            keep_eos_frames=KEEP_EOS_FRAMES,
         )
 
-        f0, n = self.acoustic_vocoder.predict_f0n(frames.en, ref_s)
-        har = self.kmodel.compute_harmonic_features(f0)
-        audio = self.acoustic_vocoder.forward_with_f0n(frames.asr, f0, n, ref_s, har)
+        utterances: list[UtteranceOutput] = []
 
-        out_len = frames.frame_lengths.max().item()
-        samples_per_frame = audio.shape[-1] // frames.frame_bucket
-        audio = audio[..., : out_len * samples_per_frame]
+        for b, item in enumerate(frames.items):
+            asr = item.asr.unsqueeze(0)
+            en = item.en.unsqueeze(0)
+            ref = batch.ref_s[b : b + 1]
 
-        for b in range(audio.shape[0]):
-            valid_samples = frames.frame_lengths[b].item() * samples_per_frame
-            audio[b, ..., valid_samples:] = 0.0
+            f0, n = self.acoustic_vocoder.predict_f0n(en, ref)
+            har = self.kmodel.compute_harmonic_features(f0)
+            audio = self.acoustic_vocoder.forward_with_f0n(asr, f0, n, ref, har)
 
-        return KModel.Output(
-            audio=audio,
-            pred_dur=frames.pred_dur,
-            frame_lengths=frames.frame_lengths,
-            duration_float=duration_float,
-        )
+            samples_per_frame = audio.shape[-1] // item.synthesis_frame_length
+            sample_length = item.return_frame_length * samples_per_frame
+            audio = audio[..., :sample_length].reshape(-1).contiguous()
+
+            text_len = int(batch.input_lengths[b].item())
+            utterances.append(
+                UtteranceOutput(
+                    audio=audio,
+                    pred_dur=item.pred_dur,
+                    duration_float=duration_float[b, :text_len].contiguous(),
+                    synthesis_frame_length=item.synthesis_frame_length,
+                    return_frame_length=item.return_frame_length,
+                    sample_length=sample_length,
+                    graphemes=batch.graphemes[b],
+                    phonemes=batch.phonemes[b],
+                )
+            )
+
+        return KModelOutput(utterances=utterances)
 
 
 class KModel(torch.nn.Module):
+    Output = KModelOutput
+
     MODEL_NAMES: dict[str, str] = {
         "hexgrad/Kokoro-82M": "kokoro-v1_0.pth",
         "hexgrad/Kokoro-82M-v1.1-zh": "kokoro-v1_1-zh.pth",
@@ -406,40 +569,42 @@ class KModel(torch.nn.Module):
     def acoustic_vocoder_module(self):
         return KokoroAcousticVocoder(self).eval()
 
-    def inference_backend(self, frame_buckets: Sequence[int] = DEFAULT_FRAME_BUCKETS):
-        return KokoroInferenceBackend(self, frame_buckets=frame_buckets)
+    def inference_backend(self):
+        return KokoroInferenceBackend(self)
 
     def export_text_duration_onnx(
-        self, path: str, batch_size: int = 1, text_bucket: int = 512, opset: int = 18
+        self,
+        path: str,
+        example_text_length: int = 64,
+        opset: int = 18,
     ):
         self.prepare_for_export()
         return self.text_duration_module().export_onnx(
-            path, batch_size=batch_size, text_bucket=text_bucket, opset=opset
+            path,
+            example_text_length=example_text_length,
+            opset=opset,
         )
 
     def export_acoustic_vocoder_onnx(
         self,
         path: str,
-        batch_size: int = 1,
-        frame_bucket: int = 512,
+        example_frame_length: int = 128,
         opset: int = 18,
     ):
         self.prepare_for_export()
         return self.acoustic_vocoder_module().export_onnx(
             path,
-            batch_size=batch_size,
-            frame_bucket=frame_bucket,
+            example_frame_length=example_frame_length,
             opset=opset,
         )
 
     def export_onnx(
         self,
         output_dir: Union[str, Path],
-        batch_size: int = 1,
-        text_buckets: Sequence[int] = DEFAULT_TEXT_BUCKETS,
-        frame_buckets: Sequence[int] = DEFAULT_FRAME_BUCKETS,
         opset: int = 18,
-    ) -> dict[str, list[Path]]:
+        example_text_length: int = 64,
+        example_frame_length: int = 128,
+    ) -> dict[str, Path]:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -447,33 +612,24 @@ class KModel(torch.nn.Module):
         text_duration = self.text_duration_module()
         acoustic_vocoder = self.acoustic_vocoder_module()
 
-        paths: dict[str, list[Path]] = {
-            ONNX_TEXT_DURATION_PREFIX: [],
-            ONNX_ACOUSTIC_VOCODER_PREFIX: [],
+        text_path = onnx_export_path(output_dir, ONNX_TEXT_DURATION_PREFIX)
+        acoustic_path = onnx_export_path(output_dir, ONNX_ACOUSTIC_VOCODER_PREFIX)
+
+        text_duration.export_onnx(
+            str(text_path),
+            example_text_length=example_text_length,
+            opset=opset,
+        )
+        acoustic_vocoder.export_onnx(
+            str(acoustic_path),
+            example_frame_length=example_frame_length,
+            opset=opset,
+        )
+
+        return {
+            ONNX_TEXT_DURATION_PREFIX: text_path,
+            ONNX_ACOUSTIC_VOCODER_PREFIX: acoustic_path,
         }
-
-        for bucket in text_buckets:
-            path = onnx_export_path(output_dir, ONNX_TEXT_DURATION_PREFIX, bucket)
-            text_duration.export_onnx(
-                str(path), batch_size=batch_size, text_bucket=bucket, opset=opset
-            )
-            paths[ONNX_TEXT_DURATION_PREFIX].append(path)
-
-        for bucket in frame_buckets:
-            path = onnx_export_path(output_dir, ONNX_ACOUSTIC_VOCODER_PREFIX, bucket)
-            acoustic_vocoder.export_onnx(
-                str(path), batch_size=batch_size, frame_bucket=bucket, opset=opset
-            )
-            paths[ONNX_ACOUSTIC_VOCODER_PREFIX].append(path)
-
-        return paths
-
-    @dataclass
-    class Output:
-        audio: torch.Tensor
-        pred_dur: Optional[torch.Tensor] = None
-        frame_lengths: Optional[torch.Tensor] = None
-        duration_float: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def forward(
@@ -482,7 +638,10 @@ class KModel(torch.nn.Module):
         input_lengths: torch.Tensor,
         ref_s: torch.Tensor,
         speed: torch.Tensor,
-    ) -> "KModel.Output":
+    ) -> KModelOutput:
         return self.inference_backend()(
-            input_ids=input_ids, input_lengths=input_lengths, ref_s=ref_s, speed=speed
+            input_ids=input_ids,
+            input_lengths=input_lengths,
+            ref_s=ref_s,
+            speed=speed,
         )

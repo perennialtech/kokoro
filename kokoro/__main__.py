@@ -43,7 +43,8 @@ def generate_audio(
     ):
         logger.debug(prepared.phonemes)
         output = backend(prepared=prepared)
-        yield output.audio.detach().cpu().reshape(-1)
+        for utterance in output.utterances:
+            yield utterance.audio.detach().cpu().reshape(-1)
 
 
 def generate_and_save_audio(
