@@ -286,7 +286,7 @@ class KONNXModel:
         config_data = load_config_data(self.repo_id, config)
 
         plbert = config_data.get("plbert", {})
-        self.vocab: dict[str, int] = config_data["vocab"]
+        self.vocab: Optional[dict[str, int]] = config_data.get("vocab")
         self.context_length = (
             int(plbert.get("max_position_embeddings", 512))
             if isinstance(plbert, dict)

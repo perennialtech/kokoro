@@ -335,7 +335,7 @@ class KModel(torch.nn.Module):
         self.repo_id = resolve_repo_id(repo_id)
         config_data = load_config_data(self.repo_id, config)
 
-        self.vocab: dict[str, int] = config_data["vocab"]
+        self.vocab: Optional[dict[str, int]] = config_data.get("vocab")
         self.bert = CustomAlbert(
             AlbertConfig(vocab_size=config_data["n_token"], **config_data["plbert"])
         )
