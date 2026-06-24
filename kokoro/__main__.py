@@ -3,16 +3,73 @@
 import argparse
 import wave
 from pathlib import Path
-from typing import Generator, TYPE_CHECKING
+from typing import Any, Generator, Optional, Sequence
 
 import numpy as np
 import torch
 from loguru import logger
 
 languages = ["a", "b", "h", "e", "f", "i", "p", "j", "z"]
+backends = ["pytorch", "onnx"]
 
-if TYPE_CHECKING:
-    pass
+
+def parse_onnx_providers(provider_args: Optional[list[str]]) -> Optional[list[str]]:
+    if not provider_args:
+        return None
+
+    providers: list[str] = []
+    for provider_group in provider_args:
+        providers.extend(
+            provider.strip()
+            for provider in provider_group.split(",")
+            if provider.strip()
+        )
+
+    return providers or None
+
+
+def load_model_and_backend(
+    backend: str,
+    repo_id: Optional[str],
+    config: Optional[Path],
+    onnx_model_dir: Optional[Path],
+    onnx_providers: Optional[Sequence[str]],
+    pytorch_device: str,
+) -> tuple[Any, Any]:
+    if backend == "pytorch":
+        from kokoro import KModel
+
+        model = KModel(repo_id=repo_id, config=config).eval()
+
+        if pytorch_device == "auto":
+            if torch.cuda.is_available():
+                model = model.to("cuda")
+        elif pytorch_device == "cuda":
+            if not torch.cuda.is_available():
+                raise ValueError("PyTorch CUDA device requested, but CUDA is not available")
+            model = model.to("cuda")
+        elif pytorch_device == "cpu":
+            model = model.to("cpu")
+        else:
+            raise ValueError(f"Unsupported PyTorch device: {pytorch_device}")
+
+        return model, model.inference_backend()
+
+    if backend == "onnx":
+        from kokoro import KONNXModel
+
+        if onnx_model_dir is None:
+            raise ValueError("--onnx-model-dir is required when backend='onnx'")
+
+        model = KONNXModel(
+            onnx_model_dir,
+            repo_id=repo_id,
+            config=config,
+            providers=onnx_providers,
+        )
+        return model, model.inference_backend()
+
+    raise ValueError(f"Unsupported backend: {backend}")
 
 
 def generate_audio(
@@ -20,12 +77,23 @@ def generate_audio(
     kokoro_language: str,
     voice: str,
     speed=1,
+    backend: str = "pytorch",
+    repo_id: Optional[str] = None,
+    config: Optional[Path] = None,
+    onnx_model_dir: Optional[Path] = None,
+    onnx_providers: Optional[Sequence[str]] = None,
+    pytorch_device: str = "auto",
 ) -> Generator[torch.Tensor, None, None]:
-    from kokoro import KModel, KPipeline, KokoroInferenceBackend
+    from kokoro import KPipeline
 
-    model = KModel().eval()
-    if torch.cuda.is_available():
-        model = model.to("cuda")
+    model, inference_backend = load_model_and_backend(
+        backend=backend,
+        repo_id=repo_id,
+        config=config,
+        onnx_model_dir=onnx_model_dir,
+        onnx_providers=onnx_providers,
+        pytorch_device=pytorch_device,
+    )
 
     frontend = KPipeline(
         lang_code=kokoro_language,
@@ -33,7 +101,6 @@ def generate_audio(
         vocab=model.vocab,
         context_length=model.context_length,
     )
-    backend = KokoroInferenceBackend(model)
 
     if isinstance(voice, str) and not voice.startswith(kokoro_language):
         logger.warning(f"Voice {voice} is not made for language {kokoro_language}")
@@ -42,7 +109,7 @@ def generate_audio(
         text, voice=voice, speed=speed, split_pattern=r"\n+"
     ):
         logger.debug(prepared.phonemes)
-        output = backend(prepared=prepared)
+        output = inference_backend(prepared=prepared)
         for utterance in output.utterances:
             yield utterance.audio.detach().cpu().reshape(-1)
 
@@ -53,6 +120,12 @@ def generate_and_save_audio(
     kokoro_language: str,
     voice: str,
     speed=1,
+    backend: str = "pytorch",
+    repo_id: Optional[str] = None,
+    config: Optional[Path] = None,
+    onnx_model_dir: Optional[Path] = None,
+    onnx_providers: Optional[Sequence[str]] = None,
+    pytorch_device: str = "auto",
 ) -> None:
     with wave.open(str(output_file.resolve()), "wb") as wav_file:
         wav_file.setnchannels(1)
@@ -60,7 +133,16 @@ def generate_and_save_audio(
         wav_file.setframerate(24000)
 
         for audio in generate_audio(
-            text, kokoro_language=kokoro_language, voice=voice, speed=speed
+            text,
+            kokoro_language=kokoro_language,
+            voice=voice,
+            speed=speed,
+            backend=backend,
+            repo_id=repo_id,
+            config=config,
+            onnx_model_dir=onnx_model_dir,
+            onnx_providers=onnx_providers,
+            pytorch_device=pytorch_device,
         ):
             audio_bytes = (
                 (audio.numpy() * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
@@ -70,6 +152,12 @@ def generate_and_save_audio(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--backend",
+        choices=backends,
+        default="pytorch",
+        help="Inference backend to use",
+    )
     parser.add_argument("-m", "--voice", default="af_heart", help="Voice to use")
     parser.add_argument("-l", "--language", choices=languages, help="Language to use")
     parser.add_argument(
@@ -88,12 +176,49 @@ def main() -> None:
     )
     parser.add_argument("-s", "--speed", type=float, default=1.0, help="Speech speed")
     parser.add_argument(
+        "--repo-id",
+        "--repo_id",
+        help="Hugging Face model repo for config, PyTorch weights, and voices",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Optional path to a Kokoro config.json file",
+    )
+    parser.add_argument(
+        "--pytorch-device",
+        "--pytorch_device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for the PyTorch backend",
+    )
+    parser.add_argument(
+        "--onnx-model-dir",
+        "--onnx_model_dir",
+        type=Path,
+        help="Directory containing text_duration.onnx and acoustic_vocoder.onnx",
+    )
+    parser.add_argument(
+        "--onnx-provider",
+        "--onnx_provider",
+        action="append",
+        dest="onnx_providers",
+        help=(
+            "ONNX Runtime execution provider. Repeat this option or pass a "
+            "comma-separated list, e.g. CUDAExecutionProvider,CPUExecutionProvider."
+        ),
+    )
+    parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
     args = parser.parse_args()
 
     if args.debug:
         logger.enable("kokoro")
+
+    onnx_providers = parse_onnx_providers(args.onnx_providers)
+    if args.backend == "onnx" and args.onnx_model_dir is None:
+        parser.error("--onnx-model-dir is required when --backend=onnx")
 
     lang = args.language or args.voice[0]
 
@@ -118,6 +243,12 @@ def main() -> None:
         kokoro_language=lang,
         voice=args.voice,
         speed=args.speed,
+        backend=args.backend,
+        repo_id=args.repo_id,
+        config=args.config,
+        onnx_model_dir=args.onnx_model_dir,
+        onnx_providers=onnx_providers,
+        pytorch_device=args.pytorch_device,
     )
 
 
