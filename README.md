@@ -98,7 +98,7 @@ for i, prepared in enumerate(
     pipeline.prepare(text, voice="af_heart", speed=1.0, split_pattern=r"\n+")
 ):
     output = backend(prepared=prepared)
-    audio = output.audio.detach().cpu().reshape(-1).numpy()
+    audio = output.utterances[0].audio.detach().cpu().reshape(-1).numpy()
 
     print(prepared.graphemes)
     print(prepared.phonemes)
@@ -117,18 +117,28 @@ prepared_items = pipeline.prepare(text, voice=voice)
 
 ## CLI
 
-The package also exposes a simple CLI.
-
-After installing locally, run the CLI through uv:
+The package also exposes a simple CLI. The default backend is PyTorch:
 
 ```bash
-uv run kokoro -m af_heart -t "Hello from Kokoro." -o hello.wav
+uv run kokoro --backend pytorch -m af_heart -t "Hello from Kokoro." -o hello.wav
 ```
 
-or from standard input:
+`--backend pytorch` can be omitted. To run through ONNX Runtime, point the CLI at a directory containing `text_duration.onnx` and `acoustic_vocoder.onnx`:
 
 ```bash
-uv run kokoro -m af_heart -o hello.wav < input.txt
+uv run kokoro --backend onnx --onnx-model-dir onnx -m af_heart -t "Hello from ONNX Kokoro." -o hello_onnx.wav
+```
+
+For ONNX GPU execution, pass providers in ONNX Runtime order:
+
+```bash
+uv run kokoro --backend onnx --onnx-model-dir onnx --onnx-provider CUDAExecutionProvider --onnx-provider CPUExecutionProvider -m af_heart -t "Hello from GPU ONNX." -o hello_onnx.wav
+```
+
+Use `--repo-id` when the voices/config should come from a repository other than the default base model. Standard input works with either backend:
+
+```bash
+uv run kokoro --backend pytorch -m af_heart -o hello.wav < input.txt
 ```
 
 Run:
@@ -185,14 +195,13 @@ pipeline = KPipeline(
     repo_id=model.repo_id,
     vocab=model.vocab,
     context_length=model.context_length,
-    text_buckets=model.text_buckets,
 )
 
 text = "Hello from Kokoro running through ONNX Runtime."
 
 for i, prepared in enumerate(pipeline.prepare(text, voice="af_heart")):
     output = model(prepared=prepared)
-    audio = output.audio.detach().cpu().reshape(-1).numpy()
+    audio = output.utterances[0].audio.detach().cpu().reshape(-1).numpy()
     sf.write(f"onnx_{i}.wav", audio, SAMPLE_RATE)
 ```
 
@@ -212,10 +221,10 @@ Save this as `export_onnx.py` and run it with `uv run python export_onnx.py`.
 from kokoro import KModel
 
 model = KModel(repo_id="hexgrad/Kokoro-82M").eval()
-model.export_onnx("onnx_out")
+model.export_onnx("onnx")
 ```
 
-The resulting directory can be loaded with `KONNXModel("onnx_out", repo_id="hexgrad/Kokoro-82M")`.
+The resulting directory can be loaded with `KONNXModel("onnx", repo_id="hexgrad/Kokoro-82M")`.
 
 ## Upstream project
 
