@@ -18,9 +18,11 @@ Install [uv](https://docs.astral.sh/uv/) if you do not already have it:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-From this repository:
+To run the examples locally, clone this repository:
 
 ```bash
+git clone https://github.com/perennialtech/kokoro.git
+cd kokoro
 uv sync
 uv pip install soundfile
 ```
@@ -32,6 +34,12 @@ If you prefer a single editable-install command instead of `uv sync`:
 ```bash
 uv venv
 uv pip install -e . soundfile
+```
+
+Alternatively, to install the package directly into another environment without cloning:
+
+```bash
+uv pip install git+https://github.com/perennialtech/kokoro.git
 ```
 
 Install `espeak-ng` with your OS package manager if you need English fallback pronunciation or languages that use the espeak frontend:
@@ -111,7 +119,7 @@ prepared_items = pipeline.prepare(text, voice=voice)
 
 The package also exposes a simple CLI.
 
-After installing with `uv sync`, run the CLI through uv:
+After installing locally, run the CLI through uv:
 
 ```bash
 uv run kokoro -m af_heart -t "Hello from Kokoro." -o hello.wav
