@@ -186,7 +186,14 @@ class KokoroAcousticVocoder(torch.nn.Module):
     ):
         self.eval()
         device = next(self.parameters()).device
-        har_frames = har_frames or frame_bucket
+
+        if har_frames is None:
+            # predict_f0n upsamples the en frames by 2 before deriving harmonics.
+            # We can dynamically calculate the expected shape using the generator!
+            dummy_f0 = torch.zeros((batch_size, frame_bucket * 2), dtype=torch.float32, device=device)
+            dummy_har = self.decoder.generator.compute_harmonic_features(dummy_f0)
+            har_frames = dummy_har.shape[-1]
+
         n_fft_plus_2 = self.decoder.generator.post_n_fft + 2
         args = (
             torch.zeros(
