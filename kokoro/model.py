@@ -137,7 +137,12 @@ class KokoroTextDuration(torch.nn.Module):
         text_mask = positions >= input_lengths.unsqueeze(1)
         valid = (~text_mask).to(dtype=ref_s.dtype)
 
-        bert_dur = self.bert(input_ids, attention_mask=valid.to(torch.int32))
+        bert_dur = self.bert(
+            input_ids,
+            attention_mask=valid.to(torch.int32),
+            token_type_ids=torch.zeros_like(input_ids),
+            position_ids=positions,
+        )
         d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
 
         duration_style = ref_s[:, 128:]
