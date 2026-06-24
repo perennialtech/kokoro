@@ -716,6 +716,7 @@ onnx = [
 dev = [
     { name = "basedpyright" },
     { name = "black" },
+    { name = "huggingface-hub" },
     { name = "isort" },
     { name = "onnxscript" },
     { name = "ruff" },
@@ -738,6 +739,7 @@ provides-extras = ["onnx"]
 dev = [
     { name = "basedpyright", specifier = ">=1.39.8" },
     { name = "black", specifier = ">=26.5.1" },
+    { name = "huggingface-hub", specifier = ">=1.20.1" },
     { name = "isort", specifier = ">=8.0.1" },
     { name = "onnxscript", specifier = ">=0.7.0" },
     { name = "ruff", specifier = ">=0.15.19" },
