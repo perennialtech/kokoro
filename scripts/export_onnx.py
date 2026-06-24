@@ -1,21 +1,22 @@
 from kokoro import KModel
 
-model = KModel(repo_id="hexgrad/Kokoro-82M")
 
-print("Exporting text and duration model...")
-model.export_text_duration_onnx(
-    path="onnx/kokoro_text_duration.onnx",
-    batch_size=1,
-    text_bucket=512,  # Max expected token length
-    opset=18,
-)
+def export_kokoro_to_onnx():
+    print("Loading PyTorch model...")
+    model = KModel()
 
-print("Exporting acoustic vocoder model...")
-model.export_acoustic_vocoder_onnx(
-    path="onnx/kokoro_acoustic_vocoder.onnx",
-    batch_size=1,
-    frame_bucket=512,  # Max expected audio frame length
-    opset=18,
-)
+    # 2. Export to ONNX
+    output_dir = "onnx"
+    print(f"Exporting ONNX models to '{output_dir}/'...")
 
-print("ONNX export complete!")
+    paths = model.export_onnx(output_dir=output_dir)
+
+    print("\nExport successful! Created the following files:")
+    for prefix, files in paths.items():
+        print(f"\n{prefix}:")
+        for f in files:
+            print(f"  - {f}")
+
+
+if __name__ == "__main__":
+    export_kokoro_to_onnx()
