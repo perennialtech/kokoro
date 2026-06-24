@@ -145,6 +145,13 @@ class KPipeline:
                 f"Language mismatch, loading {voice} voice into {self.lang_code} pipeline."
             )
         pack = torch.load(f, weights_only=True)
+
+        # Enforce exactly 2 dimensions [sequence_length, channels] for the loaded style vector
+        if len(pack.shape) == 1:
+            pack = pack.unsqueeze(0)
+        elif len(pack.shape) > 2:
+            pack = pack.view(-1, pack.shape[-1])
+
         self.voices[voice] = pack
         return pack
 

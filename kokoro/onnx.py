@@ -248,6 +248,14 @@ class KokoroONNXBackend:
             },
         )[0]
 
+        samples_per_frame = audio_np.shape[-1] // frames.frame_bucket
+        out_len = frames.frame_lengths.max().item() * samples_per_frame
+        audio_np = audio_np[..., :out_len]
+
+        for b in range(audio_np.shape[0]):
+            valid_samples = frames.frame_lengths[b].item() * samples_per_frame
+            audio_np[b, ..., valid_samples:] = 0.0
+
         return KModel.Output(
             audio=torch.from_numpy(audio_np),
             pred_dur=frames.pred_dur,

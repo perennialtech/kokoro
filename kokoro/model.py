@@ -302,6 +302,14 @@ class KokoroInferenceBackend:
         har = self.kmodel.compute_harmonic_features(f0)
         audio = self.acoustic_vocoder.forward_with_f0n(frames.asr, f0, n, ref_s, har)
 
+        out_len = frames.frame_lengths.max().item()
+        samples_per_frame = audio.shape[-1] // frames.frame_bucket
+        audio = audio[..., : out_len * samples_per_frame]
+
+        for b in range(audio.shape[0]):
+            valid_samples = frames.frame_lengths[b].item() * samples_per_frame
+            audio[b, ..., valid_samples:] = 0.0
+
         return KModel.Output(
             audio=audio,
             pred_dur=frames.pred_dur,
