@@ -37,7 +37,7 @@ class KokoroTRT:
         model = loader.load(load_weights=False)
         model.load_host_state(self.artifact.paths.host_state_path)
 
-        self.host = KokoroHostStages(model).eval().to(self.device)
+        self.host = KokoroHostStages(model).to(self.device)
 
         try:
             import torch_tensorrt
@@ -48,7 +48,7 @@ class KokoroTRT:
             ) from e
 
         ep = torch_tensorrt.load(str(self.artifact.paths.engine_path))
-        self.generator = ep.module().to(self.device).eval()
+        self.generator = ep.module().to(self.device)
 
         self.decoder_dtype = (
             torch.float16 if self.metadata.precision == "fp16" else torch.float32

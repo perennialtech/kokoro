@@ -295,7 +295,7 @@ def compile_artifact(
         compiled,
         str(paths.engine_path),
         arg_inputs=example_inputs,
-        dynamic_shapes=dynamic_shapes,
+        dynamic_shapes=plan.export_dynamic_shapes_trt_save(kokoro_model),
     )
 
     metadata = metadata_for_compile(

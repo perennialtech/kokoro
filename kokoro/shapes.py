@@ -191,7 +191,7 @@ class ShapePlan:
             for name in self.input_order()
         )
 
-    def export_dynamic_shapes(self, model):
+    def _generator_frames_dim(self, model):
         from torch.export import Dim
 
         min_generator = self.generator_frames(model, self.profile.min_frames)
@@ -208,12 +208,24 @@ class ShapePlan:
                 f"{min_generator}. Use --min-frames {required_min} or higher."
             )
 
-        generator_frames = Dim(
+        return Dim(
             "generator_frames",
             min=int(min_generator),
             max=int(max_generator),
         )
 
+    def export_dynamic_shapes(self, model):
+        generator_frames = self._generator_frames_dim(model)
+        return {
+            "x": {2: generator_frames},
+            "ref_s": None,
+            "source_pyramid": tuple(
+                {2: relation.apply_dim(generator_frames)} for relation in self.source_relations
+            ),
+        }
+
+    def export_dynamic_shapes_trt_save(self, model):
+        generator_frames = self._generator_frames_dim(model)
         return (
             {2: generator_frames},
             {},
