@@ -1,136 +1,8 @@
-from typing import Optional
+from typing import Any
 
 import torch
 
-from .types import (END_SILENCE_FRAMES, KEEP_EOS_FRAMES, FrameItem,
-                    InferenceRequest, KModelOutput, UtteranceOutput)
-
-
-def _as_tensor(value, dtype: torch.dtype) -> torch.Tensor:
-    if isinstance(value, torch.Tensor):
-        return value.to(dtype=dtype)
-    return torch.as_tensor(value, dtype=dtype)
-
-
-def _move(
-    tensor: torch.Tensor,
-    device: Optional[torch.device],
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    if device is None and dtype is None:
-        return tensor
-    return tensor.to(
-        device=device if device is not None else tensor.device,
-        dtype=dtype if dtype is not None else tensor.dtype,
-    )
-
-
-def normalize_requests(
-    input_ids: Optional[torch.Tensor] = None,
-    input_lengths: Optional[torch.Tensor] = None,
-    ref_s: Optional[torch.Tensor] = None,
-    speed: Optional[torch.Tensor] = None,
-    prepared=None,
-    device: Optional[torch.device] = None,
-    ref_dtype: torch.dtype = torch.float32,
-) -> list[InferenceRequest]:
-    if prepared is not None:
-        input_ids = _as_tensor(prepared.input_ids, torch.long)
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if input_ids.dim() != 2 or input_ids.shape[0] != 1:
-            raise ValueError(
-                f"prepared.input_ids must have shape [T] or [1,T], got {tuple(input_ids.shape)}"
-            )
-
-        length = int(prepared.input_length)
-        if length <= 0:
-            raise ValueError("prepared.input_length must be positive")
-
-        ref = _as_tensor(prepared.ref_s, ref_dtype)
-        if ref.dim() == 1:
-            ref = ref.unsqueeze(0)
-
-        speed_tensor = torch.tensor([float(prepared.speed)], dtype=torch.float32)
-
-        return [
-            InferenceRequest(
-                input_ids=_move(input_ids[:, :length].contiguous(), device),
-                ref_s=_move(ref.contiguous(), device, ref_dtype),
-                speed=_move(speed_tensor, device),
-                graphemes=getattr(prepared, "graphemes", None),
-                phonemes=getattr(prepared, "phonemes", None),
-            )
-        ]
-
-    if input_ids is None or ref_s is None or speed is None:
-        raise ValueError(
-            "input_ids, ref_s, and speed are required unless prepared is provided"
-        )
-
-    input_ids = _as_tensor(input_ids, torch.long)
-    ref_s = _as_tensor(ref_s, ref_dtype)
-    speed = _as_tensor(speed, torch.float32)
-
-    if input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-    if ref_s.dim() == 1:
-        ref_s = ref_s.unsqueeze(0)
-    if speed.dim() == 0:
-        speed = speed.unsqueeze(0)
-
-    if input_ids.dim() != 2:
-        raise ValueError(
-            f"Expected input_ids [T] or [B,T], got {tuple(input_ids.shape)}"
-        )
-    if ref_s.dim() != 2:
-        raise ValueError(f"Expected ref_s [256] or [B,256], got {tuple(ref_s.shape)}")
-    if speed.dim() != 1:
-        raise ValueError(f"Expected speed scalar or [B], got {tuple(speed.shape)}")
-
-    batch_size = int(input_ids.shape[0])
-
-    if input_lengths is None:
-        lengths = torch.full((batch_size,), input_ids.shape[1], dtype=torch.long)
-    else:
-        lengths = _as_tensor(input_lengths, torch.long)
-        if lengths.dim() == 0:
-            lengths = lengths.unsqueeze(0)
-
-    if lengths.numel() != batch_size:
-        raise ValueError(
-            f"input_lengths must have {batch_size} entries, got {lengths.numel()}"
-        )
-
-    if ref_s.shape[0] not in (1, batch_size):
-        raise ValueError(f"ref_s batch must be 1 or {batch_size}, got {ref_s.shape[0]}")
-    if speed.shape[0] not in (1, batch_size):
-        raise ValueError(f"speed batch must be 1 or {batch_size}, got {speed.shape[0]}")
-
-    requests: list[InferenceRequest] = []
-    max_len = int(input_ids.shape[1])
-
-    for b in range(batch_size):
-        length = int(lengths[b].item())
-        if length <= 0:
-            raise ValueError("input_lengths entries must be positive")
-        if length > max_len:
-            raise ValueError(f"input length {length} exceeds input_ids width {max_len}")
-
-        ref_index = b if ref_s.shape[0] == batch_size else 0
-        speed_index = b if speed.shape[0] == batch_size else 0
-
-        requests.append(
-            InferenceRequest(
-                input_ids=_move(input_ids[b : b + 1, :length].contiguous(), device),
-                ref_s=_move(
-                    ref_s[ref_index : ref_index + 1].contiguous(), device, ref_dtype
-                ),
-                speed=_move(speed[speed_index : speed_index + 1].contiguous(), device),
-            )
-        )
-
-    return requests
+from .types import END_SILENCE_FRAMES, KEEP_EOS_FRAMES, FrameItem, SynthesisResult
 
 
 def expand_frames(
@@ -173,67 +45,55 @@ def expand_frames(
     )
 
 
-class Synthesizer:
-    def __init__(self, backend):
-        self.backend = backend
+@torch.inference_mode()
+def synthesize_prepared_trt(tts: Any, prepared: Any) -> SynthesisResult:
+    input_ids = prepared.input_ids
+    ref_s = prepared.ref_s
+    speed = prepared.speed
 
-    @torch.inference_mode()
-    def __call__(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        input_lengths: Optional[torch.Tensor] = None,
-        ref_s: Optional[torch.Tensor] = None,
-        speed: Optional[torch.Tensor] = None,
-        prepared=None,
-    ) -> KModelOutput:
-        device = getattr(self.backend, "device", None)
-        ref_dtype = getattr(self.backend, "preferred_ref_dtype", torch.float32)
-
-        requests = normalize_requests(
-            input_ids=input_ids,
-            input_lengths=input_lengths,
-            ref_s=ref_s,
-            speed=speed,
-            prepared=prepared,
-            device=device,
-            ref_dtype=ref_dtype,
+    if input_ids.dim() != 2 or input_ids.shape[0] != 1:
+        raise ValueError(
+            f"prepared.input_ids must have canonical shape [1,T], got {tuple(input_ids.shape)}"
+        )
+    if ref_s.dim() != 2 or ref_s.shape != (1, 256):
+        raise ValueError(
+            f"prepared.ref_s must have canonical shape [1,256], got {tuple(ref_s.shape)}"
+        )
+    if speed.dim() != 1 or speed.shape[0] != 1:
+        raise ValueError(
+            f"prepared.speed must have canonical shape [1], got {tuple(speed.shape)}"
         )
 
-        utterances: list[UtteranceOutput] = []
+    input_ids = input_ids.contiguous().to(device=tts.device, dtype=torch.long)
+    ref_s = ref_s.contiguous().to(device=tts.device, dtype=torch.float32)
+    speed = speed.contiguous().to(device=tts.device, dtype=torch.float32)
 
-        for request in requests:
-            duration_float, duration_hidden, text_hidden = self.backend.text_duration(
-                request.input_ids,
-                request.ref_s,
-                request.speed,
-            )
+    duration_float, duration_hidden, text_hidden = tts.host.text_duration(
+        input_ids,
+        ref_s,
+        speed,
+    )
 
-            frame_item = expand_frames(
-                duration_float,
-                duration_hidden,
-                text_hidden,
-                end_silence_frames=END_SILENCE_FRAMES,
-                keep_eos_frames=KEEP_EOS_FRAMES,
-            )
+    frame_item = expand_frames(
+        duration_float,
+        duration_hidden,
+        text_hidden,
+        end_silence_frames=END_SILENCE_FRAMES,
+        keep_eos_frames=KEEP_EOS_FRAMES,
+    )
 
-            audio = self.backend.render(frame_item, request.ref_s)
-            samples_per_frame = audio.shape[-1] // frame_item.synthesis_frame_length
-            sample_length = frame_item.return_frame_length * samples_per_frame
-            audio = audio[..., :sample_length].reshape(-1).contiguous()
+    audio = tts.render_frame(frame_item, ref_s)
+    samples_per_frame = audio.shape[-1] // frame_item.synthesis_frame_length
+    sample_length = frame_item.return_frame_length * samples_per_frame
+    audio = audio[..., :sample_length].reshape(-1).contiguous()
 
-            utterances.append(
-                UtteranceOutput(
-                    audio=audio,
-                    pred_dur=frame_item.pred_dur,
-                    duration_float=duration_float[
-                        0, : request.input_length
-                    ].contiguous(),
-                    synthesis_frame_length=frame_item.synthesis_frame_length,
-                    return_frame_length=frame_item.return_frame_length,
-                    sample_length=sample_length,
-                    graphemes=request.graphemes,
-                    phonemes=request.phonemes,
-                )
-            )
-
-        return KModelOutput(utterances=utterances)
+    return SynthesisResult(
+        audio=audio,
+        pred_dur=frame_item.pred_dur,
+        duration_float=duration_float[0, : prepared.input_length].contiguous(),
+        synthesis_frame_length=frame_item.synthesis_frame_length,
+        return_frame_length=frame_item.return_frame_length,
+        sample_length=sample_length,
+        graphemes=getattr(prepared, "graphemes", None),
+        phonemes=getattr(prepared, "phonemes", None),
+    )

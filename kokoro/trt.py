@@ -1,326 +1,235 @@
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Generator, Optional, Union
 
 import torch
-from loguru import logger
 
-from .config import load_trt_metadata
-from .model import KokoroAcousticVocoder, KokoroTextDuration
-from .runtime import Synthesizer
-from .types import FrameItem, KModelOutput
-
-TRT_ENGINE_FILENAME = "generator_with_source_pyramid.pt2"
-
-
-@dataclass(frozen=True)
-class TensorRTDynamicShapeProfile:
-    min_frames: int
-    opt_frames: int
-    max_frames: int
-
-    def validate(self) -> None:
-        if self.min_frames < 1:
-            raise ValueError("min_frames must be positive")
-        if self.opt_frames < self.min_frames:
-            raise ValueError("opt_frames must be >= min_frames")
-        if self.max_frames < self.opt_frames:
-            raise ValueError("max_frames must be >= opt_frames")
+from .artifact import TensorRTArtifact
+from .model import KokoroHostStages, KokoroModelLoader
+from .pipeline import TextFrontend, VoiceStore, normalize_language_code
+from .runtime import synthesize_prepared_trt
+from .shapes import ShapePlan
+from .types import FrameItem, SynthesisResult
 
 
-def generator_frame_count(kmodel, synthesis_frames: int) -> int:
-    return int(kmodel.decoder.generator_input_frame_length(int(synthesis_frames)))
-
-
-def harmonic_frame_count(kmodel, synthesis_frames: int) -> int:
-    generator_frames = generator_frame_count(kmodel, int(synthesis_frames))
-    return int(kmodel.decoder.generator.output_frame_length(generator_frames))
-
-
-def source_frame_counts(kmodel, synthesis_frames: int) -> list[int]:
-    return [
-        int(length)
-        for length in kmodel.decoder.source_frame_lengths(int(synthesis_frames))
-    ]
-
-
-def generator_input_channels(kmodel) -> int:
-    if not kmodel.decoder.generator.ups:
-        raise ValueError("Generator exposes no upsampling layers")
-    return int(kmodel.decoder.generator.ups[0].in_channels)
-
-
-def generator_profile_shapes(
-    kmodel,
-    profile: TensorRTDynamicShapeProfile,
-) -> dict[str, dict[str, tuple[int, ...]]]:
-    profile.validate()
-
-    input_channels = generator_input_channels(kmodel)
-
-    def f(synthesis_frames: int) -> dict[str, tuple[int, ...]]:
-        generator_frames = generator_frame_count(kmodel, synthesis_frames)
-        result: dict[str, tuple[int, ...]] = {
-            "x": (1, input_channels, generator_frames),
-            "ref_s": (1, 256),
-        }
-
-        for i, (channels, source_frames) in enumerate(
-            zip(
-                kmodel.decoder.source_channels(),
-                source_frame_counts(kmodel, synthesis_frames),
-            )
-        ):
-            result[f"source_{i}"] = (1, int(channels), int(source_frames))
-
-        return result
-
-    return {
-        "min": f(profile.min_frames),
-        "opt": f(profile.opt_frames),
-        "max": f(profile.max_frames),
-    }
-
-
-class KokoroTRTBackend:
-    """
-    Explicit TensorRT backend using the shared exact synthesis runtime.
-
-    Host/PyTorch stages:
-      - text duration
-      - frame expansion
-      - ProsodyPredictor.F0Ntrain
-      - Decoder.decode_features
-      - harmonic feature generation
-      - harmonic/source pyramid generation
-
-    TensorRT stage:
-      - Generator.forward_with_source_pyramid
-    """
-
+class KokoroTRT:
     def __init__(
         self,
-        kmodel,
-        artifact_dir: Optional[Union[str, Path]] = None,
-        decoder_engine: Optional[torch.nn.Module] = None,
-        max_synthesis_frames: Optional[int] = None,
-        fallback_to_pytorch: bool = True,
-        decoder_dtype: Optional[torch.dtype] = None,
+        artifact_dir: Union[str, Path],
+        voice_dir: Optional[Union[str, Path]] = None,
+        verify_internal_shapes: bool = False,
     ):
         if not torch.cuda.is_available():
-            raise RuntimeError("KokoroTRTBackend requires CUDA")
+            raise RuntimeError("KokoroTRT requires CUDA")
+
+        self.artifact = TensorRTArtifact.load(artifact_dir)
+        self.artifact.validate_gpu()
+        self.metadata = self.artifact.metadata
 
         self.device = torch.device("cuda")
-        self.kmodel = kmodel.eval().to(self.device)
-        self.text_duration_module = KokoroTextDuration(self.kmodel).eval()
-        self.acoustic_vocoder = KokoroAcousticVocoder(self.kmodel).eval()
+        self.verify_internal_shapes = bool(verify_internal_shapes)
 
-        self.metadata: dict[str, Any] = {}
-        if artifact_dir is not None:
-            artifact_dir = Path(artifact_dir)
-            self.metadata = load_trt_metadata(artifact_dir)
-            if decoder_engine is None:
-                try:
-                    import torch_tensorrt
-                except ImportError as e:
-                    raise ImportError(
-                        "KokoroTRTBackend requires Torch-TensorRT to load compiled engines. "
-                        "Install Torch-TensorRT matching your PyTorch/CUDA stack."
-                    ) from e
+        config_data = self.artifact.load_config()
+        loader = KokoroModelLoader(
+            repo_id=self.metadata.repo_id,
+            config=config_data,
+            model=None,
+        )
+        model = loader.load(load_weights=False)
+        model.load_host_state(self.artifact.paths.host_state_path)
 
-                engine_filename = str(
-                    self.metadata.get("engine_file", TRT_ENGINE_FILENAME)
-                )
-                engine_path = str(artifact_dir / engine_filename)
-                ep = torch_tensorrt.load(engine_path)
-                decoder_engine = ep.module()
+        self.host = KokoroHostStages(model).eval().to(self.device)
 
-        if decoder_engine is None:
-            raise ValueError("decoder_engine or artifact_dir is required")
+        try:
+            import torch_tensorrt
+        except ImportError as e:
+            raise ImportError(
+                "KokoroTRT requires Torch-TensorRT >= 2.12.1 to load compiled engines. "
+                "Install Torch-TensorRT matching your PyTorch/CUDA stack."
+            ) from e
 
-        self.generator = decoder_engine.to(self.device)
-        self.fallback_to_pytorch = fallback_to_pytorch
+        ep = torch_tensorrt.load(str(self.artifact.paths.engine_path))
+        self.generator = ep.module().to(self.device).eval()
 
-        profile = self.metadata.get("profile", {})
-        metadata_min = profile.get("min_frames")
-        metadata_max = profile.get("max_frames")
+        self.decoder_dtype = (
+            torch.float16 if self.metadata.precision == "fp16" else torch.float32
+        )
+        self.profile = self.metadata.profile
+        self.min_synthesis_frames = self.profile.min_frames
+        self.max_synthesis_frames = self.profile.max_frames
+        self.shape_plan = ShapePlan.from_model(self.host.model, self.profile)
 
-        self.min_synthesis_frames = int(metadata_min if metadata_min is not None else 1)
+        self.voice_store = VoiceStore(
+            Path(voice_dir) if voice_dir is not None else self.artifact.paths.voice_dir
+        )
+        self.voice_store.set_target(self.device, torch.float32)
+        self._frontends: dict[str, TextFrontend] = {}
 
-        if max_synthesis_frames is None and metadata_max is None:
-            raise ValueError(
-                "max_synthesis_frames is required when artifact metadata has no profile.max_frames"
-            )
+    def frontend(self, lang_code: str) -> TextFrontend:
+        lang_code = normalize_language_code(lang_code)
+        cached = self._frontends.get(lang_code)
+        if cached is not None:
+            return cached
 
-        self.max_synthesis_frames = int(
-            max_synthesis_frames if max_synthesis_frames is not None else metadata_max
+        if self.host.vocab is None:
+            raise ValueError("Artifact config does not contain a vocab")
+
+        frontend = TextFrontend(
+            lang_code=lang_code,
+            repo_id=self.host.repo_id,
+            vocab=self.host.vocab,
+            context_length=self.host.context_length,
+            voice_store=self.voice_store,
+        )
+        self._frontends[lang_code] = frontend
+        return frontend
+
+    def prepare(
+        self,
+        text: Union[str, list[str]],
+        voice: Union[str, torch.Tensor],
+        language: str,
+        speed: float = 1.0,
+        split_pattern: Optional[str] = r"\n+",
+    ):
+        yield from self.frontend(language).prepare(
+            text=text,
+            voice=voice,
+            speed=speed,
+            split_pattern=split_pattern,
         )
 
-        if self.min_synthesis_frames < 1:
-            raise ValueError("TensorRT profile min_frames must be positive")
-        if self.max_synthesis_frames < 1:
-            raise ValueError("TensorRT profile max_frames must be positive")
-        if self.max_synthesis_frames < self.min_synthesis_frames:
-            raise ValueError(
-                "TensorRT profile max_frames must be >= min_frames, got "
-                f"{self.max_synthesis_frames} < {self.min_synthesis_frames}"
-            )
+    def synthesize_prepared(self, prepared) -> SynthesisResult:
+        return synthesize_prepared_trt(self, prepared)
 
-        precision = str(self.metadata.get("precision", "fp32")).lower()
-        if decoder_dtype is not None:
-            self.decoder_dtype = decoder_dtype
-        elif precision == "fp16":
-            self.decoder_dtype = torch.float16
-        else:
-            self.decoder_dtype = torch.float32
-
-        self.preferred_ref_device = self.device
-        self.preferred_ref_dtype = torch.float32
-        self.synthesizer = Synthesizer(self)
-
-    def text_duration(
+    def synthesize(
         self,
-        input_ids: torch.Tensor,
-        ref_s: torch.Tensor,
-        speed: torch.Tensor,
-    ):
-        return self.text_duration_module(input_ids, ref_s, speed)
+        text: Union[str, list[str]],
+        voice: Union[str, torch.Tensor],
+        language: str,
+        speed: float = 1.0,
+        split_pattern: Optional[str] = r"\n+",
+    ) -> Generator[SynthesisResult, None, None]:
+        for prepared in self.prepare(
+            text=text,
+            voice=voice,
+            language=language,
+            speed=speed,
+            split_pattern=split_pattern,
+        ):
+            yield self.synthesize_prepared(prepared)
 
     def _generate_with_trt(
         self,
         x: torch.Tensor,
-        ref: torch.Tensor,
+        ref_s: torch.Tensor,
         source_pyramid: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
         dtype = self.decoder_dtype
         return self.generator(
             x.to(dtype=dtype),
-            ref.to(dtype=dtype),
+            ref_s.to(dtype=dtype),
             *[source.to(dtype=dtype) for source in source_pyramid],
         ).float()
 
-    def render(self, frame_item: FrameItem, ref_s: torch.Tensor) -> torch.Tensor:
+    def render_frame(self, frame_item: FrameItem, ref_s: torch.Tensor) -> torch.Tensor:
         synthesis_frames = int(frame_item.synthesis_frame_length)
-        outside_profile = (
+        if (
             synthesis_frames < self.min_synthesis_frames
             or synthesis_frames > self.max_synthesis_frames
-        )
-
-        if outside_profile and not self.fallback_to_pytorch:
+        ):
             raise RuntimeError(
                 "Predicted synthesis frame length "
                 f"{synthesis_frames} is outside the TensorRT profile "
-                f"[{self.min_synthesis_frames}, {self.max_synthesis_frames}]"
+                f"[{self.min_synthesis_frames}, {self.max_synthesis_frames}]. "
+                "Recompile with a wider --min-frames/--max-frames profile."
             )
 
-        asr = frame_item.asr.unsqueeze(0)
-        en = frame_item.en.unsqueeze(0)
+        asr = frame_item.asr.unsqueeze(0).to(self.device)
+        en = frame_item.en.unsqueeze(0).to(self.device)
+        ref_s = ref_s.to(self.device, dtype=torch.float32)
 
-        f0, n = self.acoustic_vocoder.predict_f0n(en, ref_s)
+        f0, n = self.host.predict_f0n(en, ref_s)
+        har = self.host.compute_harmonic_features(f0)
+        source_pyramid = self.host.compute_source_pyramid(har, ref_s)
+        decoded = self.host.decode_features(asr, f0, n, ref_s)
 
-        expected_generator_frames = self.kmodel.decoder.generator_input_frame_length(
-            synthesis_frames
-        )
-        if int(f0.shape[-1]) != expected_generator_frames:
-            raise RuntimeError(
-                "F0 frame length does not match decoder/generator contract: "
-                f"got {int(f0.shape[-1])}, expected {expected_generator_frames} "
-                f"for synthesis frame length {synthesis_frames}"
-            )
-        if int(n.shape[-1]) != expected_generator_frames:
-            raise RuntimeError(
-                "Noise frame length does not match decoder/generator contract: "
-                f"got {int(n.shape[-1])}, expected {expected_generator_frames} "
-                f"for synthesis frame length {synthesis_frames}"
-            )
-
-        har = self.kmodel.compute_harmonic_features(f0)
-
-        expected_har_frames = harmonic_frame_count(self.kmodel, synthesis_frames)
-        if int(har.shape[-1]) != expected_har_frames:
-            raise RuntimeError(
-                "Harmonic feature frame length does not match decoder/generator "
-                "contract: "
-                f"got {int(har.shape[-1])}, expected {expected_har_frames} "
-                f"for synthesis frame length {synthesis_frames}"
-            )
-
-        if outside_profile:
-            logger.warning(
-                "Predicted synthesis frame length {} is outside the TensorRT "
-                "profile [{}, {}]; using PyTorch decoder fallback for this utterance.",
-                synthesis_frames,
-                self.min_synthesis_frames,
-                self.max_synthesis_frames,
-            )
-            return self.acoustic_vocoder.forward_with_f0n(asr, f0, n, ref_s, har)
-
-        source_pyramid = self.kmodel.decoder.compute_source_pyramid(
-            har,
-            ref_s[:, :128],
-        )
-
-        expected_source_frames = source_frame_counts(self.kmodel, synthesis_frames)
-        expected_source_channels = self.kmodel.decoder.source_channels()
-
-        if len(source_pyramid) != len(expected_source_frames):
-            raise RuntimeError(
-                "Source-pyramid tensor count mismatch: "
-                f"got {len(source_pyramid)}, expected {len(expected_source_frames)}"
-            )
-
-        for i, source in enumerate(source_pyramid):
-            if int(source.shape[1]) != int(expected_source_channels[i]):
-                raise RuntimeError(
-                    f"Source-pyramid tensor source_{i} channel mismatch: "
-                    f"got {int(source.shape[1])}, expected "
-                    f"{int(expected_source_channels[i])}"
-                )
-            if int(source.shape[-1]) != int(expected_source_frames[i]):
-                raise RuntimeError(
-                    f"Source-pyramid tensor source_{i} frame length mismatch: "
-                    f"got {int(source.shape[-1])}, expected "
-                    f"{int(expected_source_frames[i])} for synthesis frame length "
-                    f"{synthesis_frames}"
-                )
-
-        decoded = self.kmodel.decoder.decode_features(
-            asr,
-            f0,
-            n,
-            ref_s[:, :128],
-        )
-
-        expected_generator_channels = generator_input_channels(self.kmodel)
-        if int(decoded.shape[1]) != expected_generator_channels:
-            raise RuntimeError(
-                "Decoded generator input channel mismatch: "
-                f"got {int(decoded.shape[1])}, expected "
-                f"{expected_generator_channels}"
-            )
-
-        if int(decoded.shape[-1]) != expected_generator_frames:
-            raise RuntimeError(
-                "Decoded generator input frame length mismatch: "
-                f"got {int(decoded.shape[-1])}, expected "
-                f"{expected_generator_frames} for synthesis frame length "
-                f"{synthesis_frames}"
+        if self.verify_internal_shapes:
+            self._verify_internal_contract(
+                synthesis_frames=synthesis_frames,
+                f0=f0,
+                noise=n,
+                har=har,
+                source_pyramid=source_pyramid,
+                decoded=decoded,
             )
 
         return self._generate_with_trt(decoded, ref_s, source_pyramid)
 
-    def __call__(
+    def _verify_internal_contract(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        input_lengths: Optional[torch.Tensor] = None,
-        ref_s: Optional[torch.Tensor] = None,
-        speed: Optional[torch.Tensor] = None,
-        prepared=None,
-    ) -> KModelOutput:
-        return self.synthesizer(
-            input_ids=input_ids,
-            input_lengths=input_lengths,
-            ref_s=ref_s,
-            speed=speed,
-            prepared=prepared,
+        *,
+        synthesis_frames: int,
+        f0: torch.Tensor,
+        noise: torch.Tensor,
+        har: torch.Tensor,
+        source_pyramid: tuple[torch.Tensor, ...],
+        decoded: torch.Tensor,
+    ) -> None:
+        expected_generator_frames = self.shape_plan.generator_frames(
+            self.host.model,
+            synthesis_frames,
         )
+        if int(f0.shape[-1]) != expected_generator_frames:
+            raise RuntimeError(
+                f"F0 frame length mismatch: got {int(f0.shape[-1])}, "
+                f"expected {expected_generator_frames}"
+            )
+        if int(noise.shape[-1]) != expected_generator_frames:
+            raise RuntimeError(
+                f"Noise frame length mismatch: got {int(noise.shape[-1])}, "
+                f"expected {expected_generator_frames}"
+            )
+        if int(decoded.shape[-1]) != expected_generator_frames:
+            raise RuntimeError(
+                f"Decoded frame length mismatch: got {int(decoded.shape[-1])}, "
+                f"expected {expected_generator_frames}"
+            )
+        if int(decoded.shape[1]) != self.shape_plan.input_channels:
+            raise RuntimeError(
+                f"Decoded channel mismatch: got {int(decoded.shape[1])}, "
+                f"expected {self.shape_plan.input_channels}"
+            )
+
+        expected_har_frames = self.shape_plan.harmonic_frames(
+            self.host.model,
+            synthesis_frames,
+        )
+        if int(har.shape[-1]) != expected_har_frames:
+            raise RuntimeError(
+                f"Harmonic frame length mismatch: got {int(har.shape[-1])}, "
+                f"expected {expected_har_frames}"
+            )
+
+        expected_source_lengths = self.shape_plan.source_lengths(
+            self.host.model,
+            synthesis_frames,
+        )
+        if len(source_pyramid) != len(expected_source_lengths):
+            raise RuntimeError(
+                f"Source-pyramid tensor count mismatch: got {len(source_pyramid)}, "
+                f"expected {len(expected_source_lengths)}"
+            )
+
+        for i, source in enumerate(source_pyramid):
+            expected_channels = self.shape_plan.source_channels[i]
+            expected_frames = expected_source_lengths[i]
+            if int(source.shape[1]) != expected_channels:
+                raise RuntimeError(
+                    f"source_{i} channel mismatch: got {int(source.shape[1])}, "
+                    f"expected {expected_channels}"
+                )
+            if int(source.shape[-1]) != expected_frames:
+                raise RuntimeError(
+                    f"source_{i} frame mismatch: got {int(source.shape[-1])}, "
+                    f"expected {expected_frames}"
+                )

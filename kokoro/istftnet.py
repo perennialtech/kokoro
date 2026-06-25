@@ -39,24 +39,19 @@ def conv_transpose1d_output_length(
 class ExplicitInstanceNorm1d(nn.Module):
     """
     InstanceNorm1d implemented explicitly with reductions.
-
-    The parameters are intentionally named weight/bias so checkpoints using
-    AdaIN1d.norm.weight and AdaIN1d.norm.bias continue to load unchanged.
     """
 
     def __init__(self, num_features: int, eps: float = 1e-5):
         super().__init__()
         self.num_features = int(num_features)
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(self.num_features))
-        self.bias = nn.Parameter(torch.zeros(self.num_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mean = x.mean(dim=-1, keepdim=True)
         centered = x - mean
         var = centered.square().mean(dim=-1, keepdim=True)
         x = centered * torch.rsqrt(var + self.eps)
-        return x * self.weight.view(1, -1, 1) + self.bias.view(1, -1, 1)
+        return x
 
 
 class AdaIN1d(nn.Module):
@@ -496,201 +491,35 @@ class UpSample1d(nn.Module):
         return F.interpolate(x, scale_factor=2.0, mode="nearest")
 
 
-class ExplicitDepthwiseConvTranspose1dStride2(nn.Module):
+class StaticPhaseConvTranspose1d(nn.Module):
     """
-    Exact replacement for:
+    Inference-only exact ConvTranspose1d replacement using phase-decomposed Conv1d.
 
-        nn.ConvTranspose1d(
-            channels,
-            channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            output_padding=1,
-            groups=channels,
-        )
-
-    TensorRT/Cask is fragile for this depthwise transposed-convolution shape.
-    This module implements the same operation with elementwise ops, slicing and
-    interleaving, avoiding grouped ConvTranspose1d in the TensorRT graph.
-
-    For each channel c and input position i:
-
-        y[c, 2*i]     = x[c, i] * w[c, 1]
-        y[c, 2*i + 1] = x[c, i] * w[c, 2] + x[c, i + 1] * w[c, 0]
-
-    plus ConvTranspose1d bias added to every output sample.
-    """
-
-    def __init__(self, channels: int, bias: bool = True):
-        super().__init__()
-        self.channels = int(channels)
-        self.weight = nn.Parameter(torch.empty(self.channels, 1, 3))
-        self.bias = nn.Parameter(torch.empty(self.channels)) if bias else None
-
-    @classmethod
-    def from_conv(
-        cls,
-        conv: nn.ConvTranspose1d,
-    ) -> "ExplicitDepthwiseConvTranspose1dStride2":
-        if not _is_depthwise_stride2_deconv_for_explicit_export(conv):
-            raise ValueError(
-                "ExplicitDepthwiseConvTranspose1dStride2 can only replace "
-                "depthwise ConvTranspose1d with kernel_size=3, stride=2, "
-                "padding=1, output_padding=1, dilation=1."
-            )
-
-        module = cls(conv.in_channels, bias=conv.bias is not None).to(
-            device=conv.weight.device,
-            dtype=conv.weight.dtype,
-        )
-
-        with torch.no_grad():
-            module.weight.copy_(conv.weight.detach())
-            module.weight.requires_grad_(conv.weight.requires_grad)
-
-            if conv.bias is not None and module.bias is not None:
-                module.bias.copy_(conv.bias.detach())
-                module.bias.requires_grad_(conv.bias.requires_grad)
-
-        return module
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 3:
-            raise ValueError(
-                f"Expected input [B,C,T] for explicit depthwise deconv, got {x.shape}"
-            )
-
-        torch._assert(
-            x.shape[1] == self.channels,
-            "Explicit depthwise deconv channel count mismatch",
-        )
-
-        w = self.weight[:, 0, :]
-        w_left = w[:, 0].view(1, self.channels, 1)
-        w_center = w[:, 1].view(1, self.channels, 1)
-        w_right = w[:, 2].view(1, self.channels, 1)
-
-        # Broadcast scalar-per-channel weights against the full dynamic input
-        # length. Keep all elementwise arithmetic at length T.
-        #
-        # Avoid expressions such as:
-        #
-        #     right[..., :-1] + left[..., 1:]
-        #
-        # Although both operands have length T - 1, torch.export may still emit
-        # a broadcast-specialization guard excluding T - 1 == 1, which rejects a
-        # valid TensorRT profile with min_frames=2.
-        left = x * w_left
-        even = x * w_center
-        right = x * w_right
-
-        zero_tail = torch.zeros_like(left[..., :1])
-        left_shift = torch.cat([left, zero_tail], dim=-1)[..., 1:]
-
-        odd = right + left_shift
-
-        y = torch.stack([even, odd], dim=-1).flatten(-2)
-
-        if self.bias is not None:
-            y = y + self.bias.view(1, self.channels, 1)
-
-        return y
-
-
-def _is_depthwise_stride2_deconv_for_explicit_export(module: nn.Module) -> bool:
-    return (
-        isinstance(module, nn.ConvTranspose1d)
-        and module.in_channels == module.out_channels
-        and module.groups == module.in_channels
-        and module.kernel_size == (3,)
-        and module.stride == (2,)
-        and module.padding == (1,)
-        and module.output_padding == (1,)
-        and module.dilation == (1,)
-    )
-
-
-class ExplicitConvTranspose1dByPhase(nn.Module):
-    """
-    Exact ConvTranspose1d replacement using phase-decomposed regular Conv1d.
-
-    For a ConvTranspose1d with dilation=1,
-
-        output_length = stride * input_length + constant
-        constant = kernel_size + output_padding - stride - 2 * padding
-
-    Kokoro's transposed convolutions all have `constant % stride == 0`, so every
-    stride phase has the same dynamic length. This module computes each output
-    phase with an ordinary Conv1d over the original input, then interleaves the
-    phases.
-
-    This avoids both problematic TensorRT paths seen during debugging:
-
-      1. Native ConvTranspose1d lowering can fail in Cask with:
-            isOpConsistent(convolution.get()) failed
-
-      2. Zero-insertion rewrites create expanded dynamic tensors whose shape
-         expressions can become inconsistent at TensorRT profile minima.
-
-    The module preserves ConvTranspose1d-style tuple attributes because Kokoro's
-    shape helpers inspect `kernel_size`, `stride`, `padding`, `output_padding`,
-    and `dilation`.
+    This is an export rewrite, not a trainable layer. Weights are frozen buffers,
+    phase Conv1d kernels are precomputed once, and only ConvTranspose-like tuple
+    attributes used by shape planning are preserved.
     """
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int,
-        padding: int,
-        output_padding: int,
-        groups: int,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        weight_requires_grad: bool,
-        bias_requires_grad: bool,
+        conv: nn.ConvTranspose1d,
     ):
         super().__init__()
 
-        if int(kernel_size) < 1:
-            raise ValueError("kernel_size must be positive")
-        if int(stride) < 1:
-            raise ValueError("stride must be positive")
-        if int(groups) < 1:
-            raise ValueError("groups must be positive")
-        if int(in_channels) % int(groups) != 0:
-            raise ValueError("in_channels must be divisible by groups")
-        if int(out_channels) % int(groups) != 0:
-            raise ValueError("out_channels must be divisible by groups")
-        if int(output_padding) < 0 or int(output_padding) >= int(stride):
-            raise ValueError("output_padding must satisfy 0 <= output_padding < stride")
-        if int(padding) < 0:
-            raise ValueError("padding must be non-negative")
+        if conv.dilation != (1,):
+            raise ValueError("StaticPhaseConvTranspose1d only supports dilation=1")
 
-        self.in_channels = int(in_channels)
-        self.out_channels = int(out_channels)
-        self.groups = int(groups)
-
-        self.kernel_size = (int(kernel_size),)
-        self.stride = (int(stride),)
-        self.padding = (int(padding),)
-        self.output_padding = (int(output_padding),)
+        self.in_channels = int(conv.in_channels)
+        self.out_channels = int(conv.out_channels)
+        self.groups = int(conv.groups)
+        self.kernel_size = (int(conv.kernel_size[0]),)
+        self.stride = (int(conv.stride[0]),)
+        self.padding = (int(conv.padding[0]),)
+        self.output_padding = (int(conv.output_padding[0]),)
         self.dilation = (1,)
 
-        self.weight = nn.Parameter(
-            weight.detach().clone(),
-            requires_grad=weight_requires_grad,
-        )
-
-        if bias is None:
-            self.register_parameter("bias", None)
-        else:
-            self.bias = nn.Parameter(
-                bias.detach().clone(),
-                requires_grad=bias_requires_grad,
-            )
+        if self.output_padding[0] < 0 or self.output_padding[0] >= self.stride[0]:
+            raise ValueError("output_padding must satisfy 0 <= output_padding < stride")
 
         constant = (
             self.kernel_size[0]
@@ -700,14 +529,16 @@ class ExplicitConvTranspose1dByPhase(nn.Module):
         )
         if constant % self.stride[0] != 0:
             raise ValueError(
-                "ExplicitConvTranspose1dByPhase requires all output phases to "
-                "have the same dynamic length; expected "
-                "(kernel_size + output_padding - stride - 2 * padding) % stride == 0, "
-                f"got constant={constant}, stride={self.stride[0]}."
+                "StaticPhaseConvTranspose1d requires equal dynamic phase lengths; "
+                "expected "
+                "(kernel_size + output_padding - stride - 2 * padding) % stride == 0"
             )
 
         self.output_length_extra = constant // self.stride[0]
-        self.phase_specs: list[tuple[int, int, int]] = []
+        self.phase_specs: list[tuple[str, int, int]] = []
+
+        weight = conv.weight.detach().contiguous()
+        bias = None if conv.bias is None else conv.bias.detach().contiguous()
 
         for phase in range(self.stride[0]):
             first_tap = (phase + self.padding[0]) % self.stride[0]
@@ -715,9 +546,7 @@ class ExplicitConvTranspose1dByPhase(nn.Module):
 
             if first_tap >= self.kernel_size[0]:
                 raise ValueError(
-                    "ConvTranspose1d phase has no contributing kernel taps: "
-                    f"phase={phase}, first_tap={first_tap}, "
-                    f"kernel_size={self.kernel_size[0]}"
+                    f"ConvTranspose1d phase has no contributing taps: phase={phase}"
                 )
 
             tap_count = ((self.kernel_size[0] - 1 - first_tap) // self.stride[0]) + 1
@@ -725,59 +554,32 @@ class ExplicitConvTranspose1dByPhase(nn.Module):
             pad_right = phase_shift + self.output_length_extra
 
             if pad_left < 0 or pad_right < 0:
-                raise ValueError(
-                    "ConvTranspose1d phase decomposition would require negative "
-                    "padding, which is not supported for this layer: "
-                    f"phase={phase}, pad_left={pad_left}, pad_right={pad_right}"
-                )
+                raise ValueError("Static phase decomposition requires negative padding")
 
-            self.phase_specs.append((first_tap, pad_left, pad_right))
+            buffer_name = f"phase_weight_{phase}"
+            self.register_buffer(
+                buffer_name,
+                self._phase_conv1d_weight(weight, first_tap),
+                persistent=False,
+            )
+            self.phase_specs.append((buffer_name, pad_left, pad_right))
 
-    @classmethod
-    def from_conv(cls, conv: nn.ConvTranspose1d) -> "ExplicitConvTranspose1dByPhase":
-        if conv.dilation != (1,):
-            raise ValueError("ExplicitConvTranspose1dByPhase only supports dilation=1")
+        if bias is None:
+            self.register_buffer("bias", None, persistent=False)
+        else:
+            self.register_buffer("bias", bias, persistent=False)
 
-        weight_parameter = conv._parameters.get("weight")
-        bias_parameter = conv._parameters.get("bias")
-
-        return cls(
-            in_channels=conv.in_channels,
-            out_channels=conv.out_channels,
-            kernel_size=conv.kernel_size[0],
-            stride=conv.stride[0],
-            padding=conv.padding[0],
-            output_padding=conv.output_padding[0],
-            groups=conv.groups,
-            weight=conv.weight,
-            bias=conv.bias,
-            weight_requires_grad=bool(
-                isinstance(weight_parameter, nn.Parameter)
-                and weight_parameter.requires_grad
-            ),
-            bias_requires_grad=bool(
-                isinstance(bias_parameter, nn.Parameter)
-                and bias_parameter.requires_grad
-            ),
-        )
-
-    def _phase_conv1d_weight(self, first_tap: int) -> torch.Tensor:
-        kernel_size = self.kernel_size[0]
-        stride = self.stride[0]
+    def _phase_conv1d_weight(self, weight: torch.Tensor, first_tap: int) -> torch.Tensor:
         in_per_group = self.in_channels // self.groups
         out_per_group = self.out_channels // self.groups
 
-        weight = self.weight.view(
+        grouped = weight.view(
             self.groups,
             in_per_group,
             out_per_group,
-            kernel_size,
+            self.kernel_size[0],
         )
-
-        # ConvTranspose contributes taps in increasing kernel-index order, while
-        # Conv1d performs cross-correlation. Flip the phase tap axis so the Conv1d
-        # samples exactly the same input positions as ConvTranspose1d.
-        phase_weight = weight[..., first_tap::stride].flip(-1)
+        phase_weight = grouped[..., first_tap :: self.stride[0]].flip(-1)
         phase_weight = phase_weight.permute(0, 2, 1, 3)
         return phase_weight.reshape(
             self.out_channels,
@@ -786,23 +588,18 @@ class ExplicitConvTranspose1dByPhase(nn.Module):
         ).contiguous()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 3:
-            raise ValueError(
-                f"Expected input [B,C,T] for explicit ConvTranspose1d, got {x.shape}"
-            )
-
         torch._assert(
             x.shape[1] == self.in_channels,
-            "Explicit ConvTranspose1d input channel count mismatch",
+            "Static phase ConvTranspose1d input channel count mismatch",
         )
 
         phases: list[torch.Tensor] = []
-        for first_tap, pad_left, pad_right in self.phase_specs:
+        for weight_name, pad_left, pad_right in self.phase_specs:
             x_phase = F.pad(x, (pad_left, pad_right)) if pad_left or pad_right else x
             phases.append(
                 F.conv1d(
                     x_phase,
-                    self._phase_conv1d_weight(first_tap),
+                    getattr(self, weight_name),
                     bias=None,
                     stride=1,
                     padding=0,
@@ -812,59 +609,23 @@ class ExplicitConvTranspose1dByPhase(nn.Module):
             )
 
         y = torch.stack(phases, dim=-1).flatten(-2)
-
         if self.bias is not None:
             y = y + self.bias.view(1, self.out_channels, 1)
-
         return y
 
 
-def count_problematic_conv_transpose1d_for_tensorrt(module: nn.Module) -> int:
-    """
-    Count ConvTranspose1d modules remaining before TensorRT export.
-
-    Kokoro no longer leaves any ConvTranspose1d native for TensorRT. Native
-    lowering can fail in Cask for this dynamic 1D graph, while zero-insertion
-    rewrites produce fragile expanded symbolic shapes. The replacement pass uses
-    exact phase-decomposed Conv1d modules instead.
-    """
-
-    return sum(1 for child in module.modules() if isinstance(child, nn.ConvTranspose1d))
-
-
-def replace_conv_transpose1d_for_tensorrt(module: nn.Module) -> int:
-    """
-    Recursively replace all ConvTranspose1d modules with exact phase-decomposed
-    Conv1d equivalents.
-
-    This removes native ConvTranspose1d from the TensorRT graph without using
-    zero-insertion. The resulting graph contains ordinary Conv1d, Pad, Stack, and
-    Reshape operations with simple dynamic time dimensions.
-    """
-
+def replace_conv_transpose1d_with_static_phase(module: nn.Module) -> int:
     replacements = 0
 
     for name, child in list(module.named_children()):
         if isinstance(child, nn.ConvTranspose1d):
-            try:
-                replacement = ExplicitConvTranspose1dByPhase.from_conv(child)
-            except ValueError as e:
-                raise ValueError(
-                    "Cannot prepare ConvTranspose1d for TensorRT export at "
-                    f"{module.__class__.__name__}.{name}: {e}"
-                ) from e
-
-            setattr(module, name, replacement)
+            setattr(module, name, StaticPhaseConvTranspose1d(child))
             replacements += 1
             continue
 
-        replacements += replace_conv_transpose1d_for_tensorrt(child)
+        replacements += replace_conv_transpose1d_with_static_phase(child)
 
     return replacements
-
-
-def replace_depthwise_conv_transpose1d_for_tensorrt(module: nn.Module) -> int:
-    return replace_conv_transpose1d_for_tensorrt(module)
 
 
 class AdainResBlk1d(nn.Module):

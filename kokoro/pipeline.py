@@ -1,10 +1,9 @@
-import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Callable, Generator, List, Optional, Tuple, Union
 
 import torch
-from huggingface_hub import hf_hub_download
 from loguru import logger
 from misaki import en, espeak
 
@@ -20,7 +19,7 @@ ALIASES = {
     "zh": "z",
 }
 
-LANG_CODES = {
+LANGUAGE_CODES = {
     "a": "American English",
     "b": "British English",
     "e": "es",
@@ -33,176 +32,136 @@ LANG_CODES = {
 }
 
 
-class KPipeline:
-    """
-    Host text frontend.
+def normalize_language_code(lang_code: str) -> str:
+    lang_code = ALIASES.get(lang_code.lower(), lang_code.lower())
+    if lang_code not in LANGUAGE_CODES:
+        raise ValueError(f"Unsupported language code {lang_code!r}")
+    return lang_code
 
-    This class performs text/G2P/chunking/vocab lookup/voice selection and
-    returns exact-length numeric tensors suitable for KokoroTextDuration. It does
-    not own or execute the neural inference backend.
 
-    Voice tensors are cached on CPU by default. A backend may call
-    set_voice_target(device, dtype) to additionally cache loaded voice tensors on
-    the target device/dtype and avoid repeated CPU-to-GPU ref_s transfers.
-    """
+def infer_language_from_voice(language: Optional[str], voice: Union[str, torch.Tensor]) -> str:
+    if language:
+        return normalize_language_code(language)
 
-    def __init__(
-        self,
-        lang_code: str,
-        repo_id: Optional[str] = None,
-        vocab: Optional[dict[str, int]] = None,
-        context_length: Optional[int] = None,
-        trf: bool = False,
-        en_callable: Optional[Callable[[str], str]] = None,
-    ):
-        if repo_id is None:
-            repo_id = "hexgrad/Kokoro-82M"
-            print(
-                f"WARNING: Defaulting repo_id to {repo_id}. Pass repo_id='{repo_id}' to suppress this warning."
-            )
-        self.repo_id: str = repo_id
+    if not isinstance(voice, str):
+        raise ValueError("--language is required when voice is a tensor")
 
-        if vocab is None or context_length is None:
-            config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
-            with open(config_path, "r", encoding="utf-8") as r:
-                config_data: dict[str, Any] = json.load(r)
+    stem = Path(voice).stem if voice.endswith(".pt") else voice
+    if not stem:
+        raise ValueError("--language is required when language cannot be inferred from voice")
 
-            if vocab is None:
-                vocab = config_data["vocab"]
+    return normalize_language_code(stem[0])
 
-            if context_length is None:
-                plbert = config_data.get("plbert", {})
-                if isinstance(plbert, dict):
-                    context_length = plbert.get("max_position_embeddings", 512)
-                else:
-                    context_length = 512
 
-        if vocab is None or context_length is None:
-            raise ValueError("vocab and context_length are required")
-        if context_length <= 2:
-            raise ValueError(
-                f"context_length must be greater than 2, got {context_length}"
-            )
+@dataclass
+class PreparedInput:
+    graphemes: str
+    phonemes: str
+    input_ids: torch.Tensor
+    ref_s: torch.Tensor
+    speed: torch.Tensor
+    tokens: Optional[List[en.MToken]] = None
+    text_index: Optional[int] = None
 
-        lang_code = ALIASES.get(lang_code.lower(), lang_code.lower())
-        assert lang_code in LANG_CODES, (lang_code, LANG_CODES)
+    @property
+    def input_length(self) -> int:
+        return int(self.input_ids.shape[1])
 
-        self.lang_code = lang_code
-        self.vocab: dict[str, int] = vocab
-        self.context_length: int = int(context_length)
-        self.max_phoneme_len: int = self.context_length - 2
-        self.voices: dict[str, torch.Tensor] = {}
-        self.voice_device_cache: dict[tuple[str, str, str], torch.Tensor] = {}
-        self.voice_target_device: Optional[torch.device] = None
-        self.voice_target_dtype: Optional[torch.dtype] = None
 
-        if lang_code in "ab":
-            try:
-                fallback = espeak.EspeakFallback(british=lang_code == "b")
-            except Exception as e:
-                logger.warning("EspeakFallback not enabled: OOD words will be skipped")
-                logger.warning(str(e))
-                fallback = None
-            self.g2p = en.G2P(
-                trf=trf, british=lang_code == "b", fallback=fallback, unk=""
-            )
-        elif lang_code == "j":
-            try:
-                from misaki import ja
+class VoiceStore:
+    def __init__(self, voice_dir: Union[str, Path]):
+        self.voice_dir = Path(voice_dir)
+        self.cpu_cache: dict[str, torch.Tensor] = {}
+        self.device_cache: dict[tuple[str, str, str], torch.Tensor] = {}
+        self.target_device: Optional[torch.device] = None
+        self.target_dtype: Optional[torch.dtype] = None
 
-                self.g2p = ja.JAG2P()
-            except ImportError:
-                logger.error(
-                    "You need to `pip install misaki[ja]` to use lang_code='j'"
-                )
-                raise
-        elif lang_code == "z":
-            try:
-                from misaki import zh
-
-                self.g2p = zh.ZHG2P(
-                    version=None if repo_id.endswith("/Kokoro-82M") else "1.1",
-                    en_callable=en_callable,
-                )
-            except ImportError:
-                logger.error(
-                    "You need to `pip install misaki[zh]` to use lang_code='z'"
-                )
-                raise
-        else:
-            language = LANG_CODES[lang_code]
-            logger.warning(
-                f"Using EspeakG2P(language='{language}'). Long text is chunked by host-side sentence splitting."
-            )
-            self.g2p = espeak.EspeakG2P(language=language)
-
-    def set_voice_target(
+    def set_target(
         self,
         device: Union[str, torch.device],
         dtype: torch.dtype = torch.float32,
     ) -> None:
-        self.voice_target_device = torch.device(device)
-        self.voice_target_dtype = dtype
+        self.target_device = torch.device(device)
+        self.target_dtype = dtype
 
-    def load_single_voice(self, voice: str):
-        if voice in self.voices:
-            return self.voices[voice]
-        f = (
-            voice
-            if voice.endswith(".pt")
-            else hf_hub_download(self.repo_id, filename=f"voices/{voice}.pt")
-        )
-        if not voice.endswith(".pt") and not voice.startswith(self.lang_code):
-            logger.warning(
-                f"Language mismatch, loading {voice} voice into {self.lang_code} pipeline."
+    def _voice_path(self, voice: str) -> Path:
+        path = Path(voice)
+        if path.exists():
+            return path
+        if path.suffix == ".pt":
+            raise FileNotFoundError(f"Voice file does not exist: {path}")
+
+        artifact_path = self.voice_dir / f"{voice}.pt"
+        if not artifact_path.exists():
+            raise FileNotFoundError(
+                f"Voice {voice!r} was not found in artifact voice directory "
+                f"{self.voice_dir}. Recompile the artifact with --include-voice "
+                "or pass a local .pt voice path."
             )
-        pack = torch.load(f, weights_only=True)
+        return artifact_path
 
-        if len(pack.shape) == 1:
-            pack = pack.unsqueeze(0)
-        elif len(pack.shape) > 2:
-            pack = pack.view(-1, pack.shape[-1])
-
-        self.voices[voice] = pack
+    @staticmethod
+    def _normalize_pack(pack: torch.Tensor) -> torch.Tensor:
+        if pack.dim() == 1:
+            return pack.unsqueeze(0)
+        if pack.dim() > 2:
+            return pack.view(-1, pack.shape[-1])
         return pack
 
-    def _load_voice_cpu(
-        self, voice: Union[str, torch.Tensor], delimiter: str = ","
-    ) -> torch.Tensor:
-        if isinstance(voice, torch.Tensor):
-            return voice
-        if voice in self.voices:
-            return self.voices[voice]
-        packs = [self.load_single_voice(v) for v in voice.split(delimiter)]
-        if len(packs) == 1:
-            self.voices[voice] = packs[0]
-        else:
-            self.voices[voice] = torch.mean(torch.stack(packs), dim=0)
-        return self.voices[voice]
+    def load_single_voice(self, voice: str, lang_code: Optional[str] = None) -> torch.Tensor:
+        if voice in self.cpu_cache:
+            return self.cpu_cache[voice]
 
-    def load_voice(
+        path = self._voice_path(voice)
+        name = path.stem
+
+        if lang_code is not None and not name.startswith(lang_code):
+            logger.warning(
+                f"Language mismatch, loading {name} voice into {lang_code} pipeline."
+            )
+
+        pack = self._normalize_pack(torch.load(path, weights_only=True))
+        self.cpu_cache[voice] = pack
+        return pack
+
+    def _load_cpu(
         self,
         voice: Union[str, torch.Tensor],
+        *,
+        lang_code: Optional[str],
+        delimiter: str = ",",
+    ) -> torch.Tensor:
+        if isinstance(voice, torch.Tensor):
+            return self._normalize_pack(voice)
+
+        if voice in self.cpu_cache:
+            return self.cpu_cache[voice]
+
+        packs = [
+            self.load_single_voice(v.strip(), lang_code=lang_code)
+            for v in voice.split(delimiter)
+            if v.strip()
+        ]
+        if not packs:
+            raise ValueError("voice must not be empty")
+
+        self.cpu_cache[voice] = packs[0] if len(packs) == 1 else torch.mean(torch.stack(packs), dim=0)
+        return self.cpu_cache[voice]
+
+    def load(
+        self,
+        voice: Union[str, torch.Tensor],
+        *,
+        lang_code: Optional[str] = None,
         delimiter: str = ",",
         device: Optional[Union[str, torch.device]] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        if isinstance(voice, torch.Tensor):
-            target_device = torch.device(device) if device is not None else None
-            if target_device is None:
-                target_device = self.voice_target_device
-            target_dtype = dtype or self.voice_target_dtype
-            if target_device is None and target_dtype is None:
-                return voice
-            return voice.to(device=target_device, dtype=target_dtype)
+        base = self._load_cpu(voice, lang_code=lang_code, delimiter=delimiter)
 
-        base = self._load_voice_cpu(voice, delimiter=delimiter)
+        target_device = torch.device(device) if device is not None else self.target_device
+        target_dtype = dtype or self.target_dtype
 
-        target_device = torch.device(device) if device is not None else None
-        if target_device is None:
-            target_device = self.voice_target_device
-
-        target_dtype = dtype or self.voice_target_dtype
         if target_device is None and target_dtype is None:
             return base
 
@@ -211,8 +170,11 @@ class KPipeline:
         if target_dtype is None:
             target_dtype = base.dtype
 
+        if isinstance(voice, torch.Tensor):
+            return base.to(device=target_device, dtype=target_dtype)
+
         key = (voice, str(target_device), str(target_dtype))
-        cached = self.voice_device_cache.get(key)
+        cached = self.device_cache.get(key)
         if cached is not None:
             return cached
 
@@ -221,8 +183,70 @@ class KPipeline:
             dtype=target_dtype,
             non_blocking=target_device.type == "cuda",
         )
-        self.voice_device_cache[key] = cached
+        self.device_cache[key] = cached
         return cached
+
+
+class TextFrontend:
+    def __init__(
+        self,
+        lang_code: str,
+        repo_id: str,
+        vocab: dict[str, int],
+        context_length: int,
+        voice_store: VoiceStore,
+        trf: bool = False,
+        en_callable: Optional[Callable[[str], str]] = None,
+    ):
+        if context_length <= 2:
+            raise ValueError(f"context_length must be greater than 2, got {context_length}")
+
+        self.repo_id = repo_id
+        self.lang_code = normalize_language_code(lang_code)
+        self.vocab = vocab
+        self.context_length = int(context_length)
+        self.max_phoneme_len = self.context_length - 2
+        self.voice_store = voice_store
+
+        if self.lang_code in "ab":
+            try:
+                fallback = espeak.EspeakFallback(british=self.lang_code == "b")
+            except Exception as e:
+                logger.warning("EspeakFallback not enabled: OOD words will be skipped")
+                logger.warning(str(e))
+                fallback = None
+            self.g2p = en.G2P(
+                trf=trf,
+                british=self.lang_code == "b",
+                fallback=fallback,
+                unk="",
+            )
+        elif self.lang_code == "j":
+            try:
+                from misaki import ja
+
+                self.g2p = ja.JAG2P()
+            except ImportError:
+                logger.error("You need to `pip install misaki[ja]` to use lang_code='j'")
+                raise
+        elif self.lang_code == "z":
+            try:
+                from misaki import zh
+
+                self.g2p = zh.ZHG2P(
+                    version=None if repo_id.endswith("/Kokoro-82M") else "1.1",
+                    en_callable=en_callable,
+                )
+            except ImportError:
+                logger.error("You need to `pip install misaki[zh]` to use lang_code='z'")
+                raise
+        else:
+            language = LANGUAGE_CODES[self.lang_code]
+            logger.warning(
+                f"Using EspeakG2P(language='{language}'). Long text is chunked by "
+                "host-side sentence splitting."
+            )
+            self.g2p = espeak.EspeakG2P(language=language)
 
     @staticmethod
     def tokens_to_ps(tokens: List[en.MToken]) -> str:
@@ -261,25 +285,26 @@ class KPipeline:
             z += 1
             if z < len(tokens) and tokens[z].phonemes in bumps:
                 z += 1
-            yielded_count = self.phoneme_id_count(KPipeline.tokens_to_ps(tokens[:z]))
+            yielded_count = self.phoneme_id_count(TextFrontend.tokens_to_ps(tokens[:z]))
             if next_count - yielded_count <= self.max_phoneme_len:
                 return z
         return len(tokens)
 
     def en_tokenize(
-        self, tokens: List[en.MToken]
+        self,
+        tokens: List[en.MToken],
     ) -> Generator[Tuple[str, str, List[en.MToken]], None, None]:
         tks: List[en.MToken] = []
 
         for t in tokens:
             t.phonemes = t.phonemes or ""
-            next_count = self.phoneme_id_count(KPipeline.tokens_to_ps([*tks, t]))
+            next_count = self.phoneme_id_count(TextFrontend.tokens_to_ps([*tks, t]))
 
             if next_count > self.max_phoneme_len and tks:
                 z = self.waterfall_last(tks, next_count)
                 yield (
-                    KPipeline.tokens_to_text(tks[:z]),
-                    KPipeline.tokens_to_ps(tks[:z]),
+                    TextFrontend.tokens_to_text(tks[:z]),
+                    TextFrontend.tokens_to_ps(tks[:z]),
                     tks[:z],
                 )
                 tks = tks[z:]
@@ -287,7 +312,7 @@ class KPipeline:
             tks.append(t)
 
         if tks:
-            yield KPipeline.tokens_to_text(tks), KPipeline.tokens_to_ps(tks), tks
+            yield TextFrontend.tokens_to_text(tks), TextFrontend.tokens_to_ps(tks), tks
 
     def split_phonemes_to_context(self, phonemes: str) -> Generator[str, None, None]:
         current: list[str] = []
@@ -309,17 +334,6 @@ class KPipeline:
         if chunk:
             yield chunk
 
-    @dataclass
-    class PreparedInput:
-        graphemes: str
-        phonemes: str
-        input_ids: torch.Tensor
-        input_length: int
-        ref_s: torch.Tensor
-        speed: float
-        tokens: Optional[List[en.MToken]] = None
-        text_index: Optional[int] = None
-
     def prepare_phonemes(
         self,
         graphemes: str,
@@ -328,7 +342,7 @@ class KPipeline:
         speed: Union[float, Callable[[int], float]] = 1,
         tokens: Optional[List[en.MToken]] = None,
         text_index: Optional[int] = None,
-    ) -> "KPipeline.PreparedInput":
+    ) -> PreparedInput:
         if not phonemes:
             raise ValueError("Cannot prepare empty phoneme string")
 
@@ -338,22 +352,18 @@ class KPipeline:
                 f"Tokenized phoneme payload too long: {len(ids)} > {self.max_phoneme_len}"
             )
 
-        input_ids = torch.tensor([0, *ids, 0], dtype=torch.long)
-        input_length = int(input_ids.numel())
-
-        pack = self.load_voice(voice)
+        pack = self.voice_store.load(voice, lang_code=self.lang_code)
         ref_index = min(len(phonemes) - 1, pack.shape[0] - 1)
         speed_value = speed(len(phonemes)) if callable(speed) else speed
 
-        return self.PreparedInput(
+        return PreparedInput(
             graphemes=graphemes,
             phonemes=phonemes,
             tokens=tokens,
             text_index=text_index,
-            input_ids=input_ids,
-            input_length=input_length,
-            ref_s=pack[ref_index],
-            speed=float(speed_value),
+            input_ids=torch.tensor([[0, *ids, 0]], dtype=torch.long),
+            ref_s=pack[ref_index].reshape(1, -1).contiguous(),
+            speed=torch.tensor([float(speed_value)], dtype=torch.float32, device=pack.device),
         )
 
     def prepare_from_tokens(
@@ -361,11 +371,12 @@ class KPipeline:
         tokens: Union[str, List[en.MToken]],
         voice: Union[str, torch.Tensor],
         speed: Union[float, Callable[[int], float]] = 1,
-    ) -> Generator["KPipeline.PreparedInput", None, None]:
+    ) -> Generator[PreparedInput, None, None]:
         if isinstance(tokens, str):
             if self.phoneme_id_count(tokens) > self.max_phoneme_len:
                 raise ValueError(
-                    f"Phoneme payload too long: {self.phoneme_id_count(tokens)} > {self.max_phoneme_len}"
+                    f"Phoneme payload too long: {self.phoneme_id_count(tokens)} > "
+                    f"{self.max_phoneme_len}"
                 )
             yield self.prepare_phonemes("", tokens, voice, speed)
             return
@@ -405,7 +416,7 @@ class KPipeline:
         voice: Union[str, torch.Tensor],
         speed: Union[float, Callable[[int], float]] = 1,
         split_pattern: Optional[str] = r"\n+",
-    ) -> Generator["KPipeline.PreparedInput", None, None]:
+    ) -> Generator[PreparedInput, None, None]:
         if isinstance(text, str):
             text = re.split(split_pattern, text.strip()) if split_pattern else [text]
 
@@ -442,34 +453,3 @@ class KPipeline:
                         )
 
     __call__ = prepare
-
-    @staticmethod
-    def join_timestamps(tokens: List[en.MToken], pred_dur: torch.Tensor):
-        divisor = 80
-        if not tokens or len(pred_dur) < 3:
-            return
-
-        left = right = 2 * max(0, pred_dur[0].item() - 3)
-        i = 1
-        for t in tokens:
-            if i >= len(pred_dur) - 1:
-                break
-            if not t.phonemes:
-                if t.whitespace:
-                    i += 1
-                    left = right + pred_dur[i].item()
-                    right = left + pred_dur[i].item()
-                    i += 1
-                continue
-
-            j = i + len(t.phonemes)
-            if j >= len(pred_dur):
-                break
-
-            t.start_ts = left / divisor
-            token_dur = pred_dur[i:j].sum().item()
-            space_dur = pred_dur[j].item() if t.whitespace else 0
-            left = right + (2 * token_dur) + space_dur
-            t.end_ts = left / divisor
-            right = left + space_dur
-            i = j + (1 if t.whitespace else 0)

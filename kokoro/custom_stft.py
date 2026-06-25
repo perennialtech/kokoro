@@ -7,14 +7,6 @@ import torch.nn.functional as F
 
 
 def _frozen_conv_transpose1d(weight: torch.Tensor, stride: int) -> nn.ConvTranspose1d:
-    """
-    Build an nn.ConvTranspose1d module whose weight is a non-persistent buffer.
-
-    TensorRT generally handles module ConvTranspose nodes more reliably than
-    functional F.conv_transpose1d calls. The kernels are deterministic STFT
-    synthesis windows, not learned parameters, so keeping them as frozen buffers
-    avoids checkpoint/state_dict churn.
-    """
     module = nn.ConvTranspose1d(
         in_channels=int(weight.shape[0]),
         out_channels=int(weight.shape[1]),
@@ -24,32 +16,13 @@ def _frozen_conv_transpose1d(weight: torch.Tensor, stride: int) -> nn.ConvTransp
     )
     del module._parameters["weight"]
     module.register_buffer("weight", weight.contiguous().clone(), persistent=False)
-
-    # TensorRT export preparation may replace this frozen ConvTranspose1d with
-    # an exact phase-decomposed Conv1d implementation. Keeping the STFT kernels
-    # as module-owned buffers here avoids checkpoint/state_dict churn before
-    # export preparation runs.
     return module
 
 
 class CustomSTFT(nn.Module):
-    """
-    Real-valued STFT/iSTFT implemented with Conv1d/ConvTranspose1d.
-
-    This module avoids complex tensors and torch.stft/torch.istft. The inverse
-    path implements correct one-sided real iDFT scaling, Hann overlap-add, and
-    window-sum-square normalization.
-
-    The inverse path intentionally uses frozen nn.ConvTranspose1d modules instead
-    of functional F.conv_transpose1d calls to produce a cleaner TensorRT graph.
-    """
-
-    window: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
-    weight_forward_real: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
-    weight_forward_imag: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
-    weight_backward_real: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
-    weight_backward_imag: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
-    weight_window_square: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
+    window: torch.Tensor
+    weight_forward_real: torch.Tensor
+    weight_forward_imag: torch.Tensor
 
     def __init__(
         self,
@@ -110,16 +83,6 @@ class CustomSTFT(nn.Module):
         weight_backward_imag = torch.from_numpy(inverse_imag).float().unsqueeze(1)
         weight_window_square = (win * win).view(1, 1, -1)
 
-        self.register_buffer(
-            "weight_backward_real", weight_backward_real, persistent=False
-        )
-        self.register_buffer(
-            "weight_backward_imag", weight_backward_imag, persistent=False
-        )
-        self.register_buffer(
-            "weight_window_square", weight_window_square, persistent=False
-        )
-
         self.deconv_real = _frozen_conv_transpose1d(
             weight_backward_real, stride=self.hop_length
         )
@@ -150,9 +113,6 @@ class CustomSTFT(nn.Module):
 
         magnitude = torch.sqrt(real.square() + imag.square() + 1e-14)
         phase = torch.atan2(imag, real)
-        phase = torch.where(
-            (imag == 0) & (real < 0), torch.full_like(phase, torch.pi), phase
-        )
         return magnitude, phase
 
     def inverse(

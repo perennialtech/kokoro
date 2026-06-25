@@ -12,11 +12,6 @@ MODEL_FILENAMES: dict[str, str] = {
 }
 
 CONFIG_FILENAME = "config.json"
-ONNX_METADATA_FILENAME = "metadata.json"
-TRT_METADATA_FILENAME = "metadata.json"
-
-ONNX_TEXT_DURATION_PREFIX = "text_duration"
-ONNX_ACOUSTIC_VOCODER_PREFIX = "acoustic_vocoder"
 
 
 def resolve_repo_id(repo_id: Optional[str]) -> str:
@@ -73,40 +68,3 @@ def get_context_length(config_data: dict[str, Any]) -> int:
     if isinstance(plbert, dict):
         return int(plbert.get("max_position_embeddings", 512))
     return 512
-
-
-def load_exported_config(model_dir: Union[str, Path]) -> dict[str, Any]:
-    return load_json(Path(model_dir) / CONFIG_FILENAME)
-
-
-def save_exported_config(
-    model_dir: Union[str, Path], config_data: dict[str, Any]
-) -> None:
-    save_json(Path(model_dir) / CONFIG_FILENAME, config_data)
-
-
-def onnx_export_path(output_dir: Union[str, Path], prefix: str) -> Path:
-    return Path(output_dir) / f"{prefix}.onnx"
-
-
-def load_artifact_metadata(
-    artifact_dir: Union[str, Path],
-    filename: str = ONNX_METADATA_FILENAME,
-) -> dict[str, Any]:
-    return load_json(Path(artifact_dir) / filename)
-
-
-def save_artifact_metadata(
-    artifact_dir: Union[str, Path],
-    metadata: dict[str, Any],
-    filename: str = ONNX_METADATA_FILENAME,
-) -> None:
-    save_json(Path(artifact_dir) / filename, metadata)
-
-
-def load_trt_metadata(artifact_dir: Union[str, Path]) -> dict[str, Any]:
-    return load_artifact_metadata(artifact_dir, TRT_METADATA_FILENAME)
-
-
-def save_trt_metadata(artifact_dir: Union[str, Path], metadata: dict[str, Any]) -> None:
-    save_artifact_metadata(artifact_dir, metadata, TRT_METADATA_FILENAME)
