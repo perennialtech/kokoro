@@ -3,8 +3,10 @@ This script makes the ONNX model compatible with Triton inference server.
 """
 
 import sys
-import onnx
+
 import onnx_graphsurgeon as gs
+
+import onnx
 
 
 def add_squeeze(graph, speed_input, speed_unsqueezed):

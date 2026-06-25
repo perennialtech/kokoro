@@ -2,11 +2,20 @@
 
 Inference tooling for Kokoro-82M.
 
-This fork keeps the text frontend and neural inference backend explicit:
+This fork uses an explicit frontend/backend split and exact internal inference:
 
 - `KPipeline` prepares text, phonemes, token IDs, voice style, and speed tensors.
-- `KModel` / `KokoroInferenceBackend` run the PyTorch model.
-- `KONNXModel` / `KokoroONNXBackend` run exported ONNX models with ONNX Runtime.
+- `KModel` owns neural module construction and PyTorch checkpoint loading.
+- `KokoroInferenceBackend`, `KokoroONNXBackend`, and `KokoroTRTBackend` implement the same small backend interface.
+- `Synthesizer` performs the shared runtime flow for every backend:
+  1. normalize inputs into exact single-utterance requests
+  2. run text duration
+  3. expand token features to acoustic frames
+  4. render audio
+  5. trim end silence
+  6. return `KModelOutput`
+
+Public batch-like inputs are still accepted, but they are sliced and synthesized one utterance at a time. Internally there is no padded/masked neural inference path.
 
 Older examples that iterate over `KPipeline(...)` as `(graphemes, phonemes, audio)` are not valid for this fork. `KPipeline` yields prepared inputs; pass those inputs to a backend to synthesize audio.
 
@@ -57,7 +66,7 @@ uv pip install "misaki[ja]"
 uv pip install "misaki[zh]"
 ```
 
-For the complete set of language codes supported by the installed version, use the source of truth in `kokoro.pipeline.LANG_CODES`.
+For the complete set of language codes supported by the installed version, use `kokoro.pipeline.LANG_CODES`.
 
 ## PyTorch inference
 
@@ -117,13 +126,22 @@ prepared_items = pipeline.prepare(text, voice=voice)
 
 ## CLI
 
-The package also exposes a simple CLI. The default backend is PyTorch:
+The package exposes a simple CLI. The default backend is PyTorch:
 
 ```bash
 uv run kokoro --backend pytorch -m af_heart -t "Hello from Kokoro." -o hello.wav
 ```
 
-`--backend pytorch` can be omitted. To run through ONNX Runtime, point the CLI at a directory containing `text_duration.onnx` and `acoustic_vocoder.onnx`:
+`--backend pytorch` can be omitted.
+
+To run through ONNX Runtime, point the CLI at a self-contained ONNX export directory containing:
+
+```text
+text_duration.onnx
+acoustic_vocoder.onnx
+metadata.json
+config.json
+```
 
 ```bash
 uv run kokoro --backend onnx --onnx-model-dir onnx -m af_heart -t "Hello from ONNX Kokoro." -o hello_onnx.wav
@@ -132,10 +150,17 @@ uv run kokoro --backend onnx --onnx-model-dir onnx -m af_heart -t "Hello from ON
 For ONNX GPU execution, pass providers in ONNX Runtime order:
 
 ```bash
-uv run kokoro --backend onnx --onnx-model-dir onnx --onnx-provider CUDAExecutionProvider --onnx-provider CPUExecutionProvider -m af_heart -t "Hello from GPU ONNX." -o hello_onnx.wav
+uv run kokoro --backend onnx --onnx-model-dir onnx \
+  --onnx-provider CUDAExecutionProvider \
+  --onnx-provider CPUExecutionProvider \
+  -m af_heart \
+  -t "Hello from GPU ONNX." \
+  -o hello_onnx.wav
 ```
 
-Use `--repo-id` when the voices/config should come from a repository other than the default base model. Standard input works with either backend:
+Use `--repo-id` for PyTorch/TensorRT when the config, weights, and voices should come from a repository other than the default base model. ONNX exports carry their own config and metadata, including the source `repo_id` used for voice loading.
+
+Standard input works with any backend:
 
 ```bash
 uv run kokoro --backend pytorch -m af_heart -o hello.wav < input.txt
@@ -176,17 +201,15 @@ from huggingface_hub import snapshot_download
 from kokoro import KONNXModel, KPipeline
 
 ONNX_REPO = "8q0sb/Kokoro-82M-v1.0-ONNX"
-MODEL_REPO = "hexgrad/Kokoro-82M"
 SAMPLE_RATE = 24000
 
 onnx_dir = snapshot_download(
     repo_id=ONNX_REPO,
-    allow_patterns=["*.onnx"],
+    allow_patterns=["*.onnx", "metadata.json", "config.json"],
 )
 
 model = KONNXModel(
     onnx_dir,
-    repo_id=MODEL_REPO,
     # providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
 )
 
@@ -205,11 +228,11 @@ for i, prepared in enumerate(pipeline.prepare(text, voice="af_heart")):
     sf.write(f"onnx_{i}.wav", audio, SAMPLE_RATE)
 ```
 
-Use the same base model repository for config and voices as the ONNX export was built from.
+`KONNXModel` no longer downloads model config from Hugging Face. It reads `config.json` and `metadata.json` from the ONNX export directory.
 
 ## Export ONNX yourself
 
-If you need a custom export, install the ONNX export dependencies required by your PyTorch version and export from a compatible PyTorch checkpoint:
+If you need a custom export, install the ONNX export dependencies required by your PyTorch version:
 
 ```bash
 uv pip install onnxscript
@@ -218,13 +241,64 @@ uv pip install onnxscript
 Save this as `export_onnx.py` and run it with `uv run python export_onnx.py`.
 
 ```python
-from kokoro import KModel
+from kokoro import KModel, export_onnx
 
 model = KModel(repo_id="hexgrad/Kokoro-82M").eval()
-model.export_onnx("onnx")
+export_onnx(model, "onnx")
 ```
 
-The resulting directory can be loaded with `KONNXModel("onnx", repo_id="hexgrad/Kokoro-82M")`.
+The resulting directory is self-contained for model metadata:
+
+```text
+onnx/
+  text_duration.onnx
+  acoustic_vocoder.onnx
+  metadata.json
+  config.json
+```
+
+Load it with:
+
+```python
+from kokoro import KONNXModel
+
+model = KONNXModel("onnx")
+```
+
+## TensorRT
+
+TensorRT compilation targets only `KokoroDecodeGenerateWithHar`, the decoder/generator stage.
+
+Host/PyTorch stages remain explicit:
+
+- text duration
+- frame expansion
+- F0/noise prediction
+- harmonic feature generation
+
+Compile:
+
+```bash
+uv run python -m kokoro.trt_compile \
+  --output-dir ./build \
+  --repo-id hexgrad/Kokoro-82M \
+  --precision fp16 \
+  --min-frames 16 \
+  --opt-frames 256 \
+  --max-frames 1024
+```
+
+Run:
+
+```bash
+uv run kokoro --backend tensorrt \
+  --trt-artifact-dir ./build \
+  -m af_heart \
+  -t "Hello from TensorRT Kokoro." \
+  -o hello_trt.wav
+```
+
+If a predicted utterance exceeds the TensorRT profile max frame length, the runtime falls back to the PyTorch decoder by default. Pass `--no-trt-pytorch-fallback` to raise instead.
 
 ## Upstream project
 

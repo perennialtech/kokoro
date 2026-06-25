@@ -1,11 +1,12 @@
+import json
+import re
 from dataclasses import dataclass
+from typing import Any, Callable, Generator, List, Optional, Tuple, Union
+
+import torch
 from huggingface_hub import hf_hub_download
 from loguru import logger
 from misaki import en, espeak
-from typing import Any, Callable, Generator, List, Optional, Tuple, Union
-import json
-import re
-import torch
 
 ALIASES = {
     "en-us": "a",
@@ -39,6 +40,10 @@ class KPipeline:
     This class performs text/G2P/chunking/vocab lookup/voice selection and
     returns exact-length numeric tensors suitable for KokoroTextDuration. It does
     not own or execute the neural inference backend.
+
+    Voice tensors are cached on CPU by default. A backend may call
+    set_voice_target(device, dtype) to additionally cache loaded voice tensors on
+    the target device/dtype and avoid repeated CPU-to-GPU ref_s transfers.
     """
 
     def __init__(
@@ -87,6 +92,9 @@ class KPipeline:
         self.context_length: int = int(context_length)
         self.max_phoneme_len: int = self.context_length - 2
         self.voices: dict[str, torch.Tensor] = {}
+        self.voice_device_cache: dict[tuple[str, str, str], torch.Tensor] = {}
+        self.voice_target_device: Optional[torch.device] = None
+        self.voice_target_dtype: Optional[torch.dtype] = None
 
         if lang_code in "ab":
             try:
@@ -128,6 +136,14 @@ class KPipeline:
             )
             self.g2p = espeak.EspeakG2P(language=language)
 
+    def set_voice_target(
+        self,
+        device: Union[str, torch.device],
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        self.voice_target_device = torch.device(device)
+        self.voice_target_dtype = dtype
+
     def load_single_voice(self, voice: str):
         if voice in self.voices:
             return self.voices[voice]
@@ -150,7 +166,7 @@ class KPipeline:
         self.voices[voice] = pack
         return pack
 
-    def load_voice(
+    def _load_voice_cpu(
         self, voice: Union[str, torch.Tensor], delimiter: str = ","
     ) -> torch.Tensor:
         if isinstance(voice, torch.Tensor):
@@ -163,6 +179,50 @@ class KPipeline:
         else:
             self.voices[voice] = torch.mean(torch.stack(packs), dim=0)
         return self.voices[voice]
+
+    def load_voice(
+        self,
+        voice: Union[str, torch.Tensor],
+        delimiter: str = ",",
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        if isinstance(voice, torch.Tensor):
+            target_device = torch.device(device) if device is not None else None
+            if target_device is None:
+                target_device = self.voice_target_device
+            target_dtype = dtype or self.voice_target_dtype
+            if target_device is None and target_dtype is None:
+                return voice
+            return voice.to(device=target_device, dtype=target_dtype)
+
+        base = self._load_voice_cpu(voice, delimiter=delimiter)
+
+        target_device = torch.device(device) if device is not None else None
+        if target_device is None:
+            target_device = self.voice_target_device
+
+        target_dtype = dtype or self.voice_target_dtype
+        if target_device is None and target_dtype is None:
+            return base
+
+        if target_device is None:
+            target_device = base.device
+        if target_dtype is None:
+            target_dtype = base.dtype
+
+        key = (voice, str(target_device), str(target_dtype))
+        cached = self.voice_device_cache.get(key)
+        if cached is not None:
+            return cached
+
+        cached = base.to(
+            device=target_device,
+            dtype=target_dtype,
+            non_blocking=target_device.type == "cuda",
+        )
+        self.voice_device_cache[key] = cached
+        return cached
 
     @staticmethod
     def tokens_to_ps(tokens: List[en.MToken]) -> str:
@@ -217,9 +277,11 @@ class KPipeline:
 
             if next_count > self.max_phoneme_len and tks:
                 z = self.waterfall_last(tks, next_count)
-                yield KPipeline.tokens_to_text(tks[:z]), KPipeline.tokens_to_ps(
-                    tks[:z]
-                ), tks[:z]
+                yield (
+                    KPipeline.tokens_to_text(tks[:z]),
+                    KPipeline.tokens_to_ps(tks[:z]),
+                    tks[:z],
+                )
                 tks = tks[z:]
 
             tks.append(t)
@@ -279,7 +341,7 @@ class KPipeline:
         input_ids = torch.tensor([0, *ids, 0], dtype=torch.long)
         input_length = int(input_ids.numel())
 
-        pack = self.load_voice(voice).float()
+        pack = self.load_voice(voice)
         ref_index = min(len(phonemes) - 1, pack.shape[0] - 1)
         speed_value = speed(len(phonemes)) if callable(speed) else speed
 

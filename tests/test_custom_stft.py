@@ -1,6 +1,7 @@
-import torch
 import numpy as np
 import pytest
+import torch
+
 from kokoro.custom_stft import CustomSTFT
 from kokoro.istftnet import TorchSTFT
 

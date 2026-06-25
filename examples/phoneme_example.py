@@ -1,6 +1,7 @@
-from kokoro import KPipeline
 import torch
 from scipy.io import wavfile
+
+from kokoro import KPipeline
 
 
 def save_audio(audio: torch.Tensor, filename: str):

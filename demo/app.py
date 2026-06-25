@@ -1,8 +1,10 @@
-import spaces
-from kokoro import KModel, KPipeline
-import gradio as gr
 import random
+
+import gradio as gr
+import spaces
 import torch
+
+from kokoro import KModel, KPipeline
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 models = {

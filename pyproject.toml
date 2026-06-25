@@ -39,11 +39,18 @@ dev = [
     "black>=26.5.1",
     "huggingface-hub>=1.20.1",
     "isort>=8.0.1",
+    "nvidia-modelopt>=0.44.0",
     "onnxscript>=0.7.0",
     "ruff>=0.15.19",
+    "torch-tensorrt>=2.12.1",
     "torchvision>=0.27.1",
 ]
 
 [project.urls]
 Homepage = "https://github.com/hexgrad/kokoro"
 Repository = "https://github.com/hexgrad/kokoro"
+
+[project.optional-dependencies]
+trt = [
+    "torch-tensorrt>=2.12.1",
+]

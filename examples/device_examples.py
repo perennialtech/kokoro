@@ -3,8 +3,10 @@ Quick example to show how device selection can be controlled, and was checked
 """
 
 import time
-from kokoro import KPipeline
+
 from loguru import logger
+
+from kokoro import KPipeline
 
 
 def generate_audio(pipeline, text):
