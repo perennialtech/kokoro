@@ -18,7 +18,7 @@ def artifact_dir() -> str:
     not torch.cuda.is_available(), reason="TensorRT runtime requires CUDA"
 )
 def test_trt_runtime_synthesizes_inside_profile():
-    tts = KokoroTRT(artifact_dir())
+    tts = KokoroTRT(artifact_dir(), verify_internal_shapes=True)
 
     voice = os.getenv("KOKORO_TRT_VOICE", "af_heart")
     language = os.getenv("KOKORO_TRT_LANG", voice[0])
@@ -47,7 +47,7 @@ def test_trt_runtime_synthesizes_inside_profile():
     not torch.cuda.is_available(), reason="TensorRT runtime requires CUDA"
 )
 def test_trt_runtime_out_of_profile_raises():
-    tts = KokoroTRT(artifact_dir())
+    tts = KokoroTRT(artifact_dir(), verify_internal_shapes=True)
 
     too_many_frames = tts.max_synthesis_frames + 1
     frame_item = FrameItem(

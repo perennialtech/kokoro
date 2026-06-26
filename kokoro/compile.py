@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import re
 import shutil
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -12,10 +11,12 @@ from huggingface_hub import hf_hub_download
 
 from .artifact import ArtifactMetadata, ArtifactPaths, TensorRTArtifact
 from .config import save_json
-from .model import GeneratorExportBuilder, KokoroHostStages, KokoroModelLoader
+from .model import GeneratorExportBuilder, KokoroModelLoader
+from .onnx_export import export_generator_onnx
 from .shapes import Profile, ShapePlan
+from .trt_builder import build_engine_from_onnx
 
-SUPPORTED_TORCH_TENSORRT = (2, 12, 1)
+DEFAULT_ONNX_OPSET = 18
 
 
 def sha256_file(path: Optional[str]) -> Optional[str]:
@@ -33,32 +34,6 @@ def sha256_file(path: Optional[str]) -> Optional[str]:
     return h.hexdigest()
 
 
-def version_tuple(value: str) -> tuple[int, ...]:
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", value)
-    if not match:
-        return (0, 0, 0)
-    return tuple(int(group) for group in match.groups())
-
-
-def require_torch_tensorrt():
-    try:
-        import torch_tensorrt
-    except ImportError as e:
-        raise ImportError(
-            "TensorRT compilation requires torch-tensorrt >= 2.12.1. "
-            "Install Torch-TensorRT matching your PyTorch/CUDA/TensorRT stack."
-        ) from e
-
-    current = version_tuple(str(getattr(torch_tensorrt, "__version__", "0.0.0")))
-    if current < SUPPORTED_TORCH_TENSORRT:
-        raise RuntimeError(
-            "Kokoro TensorRT compilation supports torch-tensorrt >= 2.12.1 only; "
-            f"found {getattr(torch_tensorrt, '__version__', None)!r}"
-        )
-
-    return torch_tensorrt
-
-
 def get_tensorrt_version() -> Optional[str]:
     try:
         import tensorrt as trt
@@ -66,36 +41,6 @@ def get_tensorrt_version() -> Optional[str]:
         return str(trt.__version__)
     except Exception:
         return None
-
-
-def compile_exported_program_with_tensorrt(
-    torch_tensorrt: Any,
-    exported_program: torch.export.ExportedProgram,
-    inputs: list[Any],
-    enabled_precisions: set[torch.dtype],
-    workspace_size: Optional[int],
-    builder_optimization_level: Optional[int],
-) -> Any:
-    kwargs: dict[str, Any] = {
-        "ir": "dynamo",
-        "inputs": inputs,
-        "enabled_precisions": enabled_precisions,
-        "require_full_compilation": True,
-    }
-
-    if workspace_size is not None:
-        workspace_size = int(workspace_size)
-        if workspace_size <= 0:
-            raise ValueError("workspace_size must be positive when provided")
-        kwargs["workspace_size"] = workspace_size
-
-    if builder_optimization_level is not None:
-        builder_optimization_level = int(builder_optimization_level)
-        if not 0 <= builder_optimization_level <= 5:
-            raise ValueError("builder_optimization_level must be between 0 and 5")
-        kwargs["optimization_level"] = builder_optimization_level
-
-    return torch_tensorrt.compile(exported_program, **kwargs)
 
 
 def validate_generator_profile_shapes(
@@ -182,10 +127,13 @@ def metadata_for_compile(
     profile: Profile,
     precision: str,
     shapes: dict[str, dict[str, tuple[int, ...]]],
-    torch_tensorrt: Any,
     workspace_size: Optional[int],
     builder_optimization_level: Optional[int],
+    onnx_opset: int,
+    input_names: tuple[str, ...],
+    output_names: tuple[str, ...],
 ) -> ArtifactMetadata:
+    tensorrt_version = get_tensorrt_version()
     major, minor = torch.cuda.get_device_capability()
     return ArtifactMetadata.create(
         repo_id=model.repo_id,
@@ -199,14 +147,23 @@ def metadata_for_compile(
         },
         versions={
             "torch": torch.__version__,
-            "tensorrt": get_tensorrt_version(),
-            "torch_tensorrt": str(getattr(torch_tensorrt, "__version__", None)),
+            "tensorrt": tensorrt_version,
         },
         precision=precision,
         workspace_size=workspace_size,
         builder_optimization_level=builder_optimization_level,
         profile=profile,
         shapes=shapes,
+        input_names=input_names,
+        output_names=output_names,
+        onnx_opset=onnx_opset,
+        tensorrt_runtime_api={
+            "runtime": "tensorrt.Runtime",
+            "engine": "ICudaEngine",
+            "context": "IExecutionContext",
+            "execute": "execute_async_v3",
+            "version": tensorrt_version,
+        },
     )
 
 
@@ -222,13 +179,12 @@ def compile_artifact(
     builder_optimization_level: Optional[int] = 0,
     validate_profile: bool = True,
     include_voices: Optional[list[str]] = None,
+    onnx_opset: int = DEFAULT_ONNX_OPSET,
 ) -> None:
     if precision not in {"fp32", "fp16"}:
         raise ValueError("precision must be fp32 or fp16")
     if not torch.cuda.is_available():
         raise RuntimeError("Torch-TensorRT compilation requires CUDA")
-
-    torch_tensorrt = require_torch_tensorrt()
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -263,39 +219,27 @@ def compile_artifact(
             groups=("min",),
         )
 
-    inputs = plan.tensorrt_inputs(
-        model=kokoro_model,
-        dtype=dtype,
-        torch_tensorrt=torch_tensorrt,
-    )
     example_inputs = plan.example_tensors(kokoro_model, dtype)
-    dynamic_shapes = plan.export_dynamic_shapes(kokoro_model)
-    enabled_precisions = {torch.float16} if precision == "fp16" else {torch.float32}
 
-    with torch.inference_mode():
-        exported_program = torch.export.export(
-            module,
-            example_inputs,
-            dynamic_shapes=dynamic_shapes,
-            strict=False,
-        )
+    export_generator_onnx(
+        module=module,
+        example_inputs=example_inputs,
+        shape_plan=plan,
+        model=kokoro_model,
+        output_path=paths.onnx_path,
+        opset_version=onnx_opset,
+    )
 
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
-        compiled = compile_exported_program_with_tensorrt(
-            torch_tensorrt=torch_tensorrt,
-            exported_program=exported_program,
-            inputs=inputs,
-            enabled_precisions=enabled_precisions,
-            workspace_size=workspace_size,
-            builder_optimization_level=builder_optimization_level,
-        )
-
-    torch_tensorrt.save(
-        compiled,
-        str(paths.engine_path),
-        arg_inputs=example_inputs,
-        dynamic_shapes=plan.export_dynamic_shapes_trt_save(kokoro_model),
+    build_engine_from_onnx(
+        onnx_path=paths.onnx_path,
+        engine_path=paths.engine_path,
+        shapes=shapes,
+        input_order=plan.input_order(),
+        precision=precision,
+        workspace_size=workspace_size,
+        builder_optimization_level=builder_optimization_level,
     )
 
     metadata = metadata_for_compile(
@@ -303,9 +247,11 @@ def compile_artifact(
         profile=profile,
         precision=precision,
         shapes=shapes,
-        torch_tensorrt=torch_tensorrt,
         workspace_size=workspace_size,
         builder_optimization_level=builder_optimization_level,
+        onnx_opset=onnx_opset,
+        input_names=plan.input_order(),
+        output_names=("audio",),
     )
     TensorRTArtifact.write_metadata(paths.metadata_path, metadata)
 
@@ -363,6 +309,9 @@ def main() -> None:
     parser.add_argument("--min-frames", "--min_frames", type=int, default=2)
     parser.add_argument("--opt-frames", "--opt_frames", type=int, default=256)
     parser.add_argument("--max-frames", "--max_frames", type=int, default=1024)
+    parser.add_argument(
+        "--onnx-opset", "--onnx_opset", type=int, default=DEFAULT_ONNX_OPSET
+    )
     args = parser.parse_args()
 
     workspace_size = (
@@ -386,6 +335,7 @@ def main() -> None:
         builder_optimization_level=args.builder_optimization_level,
         validate_profile=not args.skip_profile_validation,
         include_voices=expand_voice_args(args.include_voices),
+        onnx_opset=args.onnx_opset,
     )
 
 

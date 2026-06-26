@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from kokoro.config import (CONFIG_FILENAME, HOST_STATE_FILENAME,
-                           TRT_METADATA_FILENAME)
-from kokoro.trt import TRT_ENGINE_FILENAME
+from kokoro.artifact import (CONFIG_FILENAME, HOST_STATE_FILENAME,
+                             ONNX_FILENAME, TRT_ENGINE_FILENAME,
+                             TRT_METADATA_FILENAME)
 
 
 def artifact_dir() -> Path:
@@ -23,6 +23,8 @@ def test_compiler_artifact_contains_required_files():
     assert (root / HOST_STATE_FILENAME).is_file()
     assert (root / TRT_METADATA_FILENAME).is_file()
     assert (root / TRT_ENGINE_FILENAME).is_file()
+    assert (root / ONNX_FILENAME).is_file()
+    assert TRT_ENGINE_FILENAME.endswith(".plan")
 
 
 def test_trt_metadata_precision_profile_and_source_shapes():
@@ -30,11 +32,21 @@ def test_trt_metadata_precision_profile_and_source_shapes():
 
     metadata = json.loads((root / TRT_METADATA_FILENAME).read_text())
 
-    assert metadata["artifact_type"] == "kokoro_generator_with_source_pyramid_tensorrt"
+    assert (
+        metadata["artifact_type"]
+        == "kokoro_generator_with_source_pyramid_tensorrt_plan"
+    )
     assert metadata["engine_file"] == TRT_ENGINE_FILENAME
+    assert metadata["engine_file"].endswith(".plan")
+    assert metadata["onnx_file"] == ONNX_FILENAME
     assert metadata["config_file"] == CONFIG_FILENAME
     assert metadata["host_state_file"] == HOST_STATE_FILENAME
     assert metadata["precision"] in {"fp32", "fp16"}
+    assert metadata["input_names"][:2] == ["x", "ref_s"]
+    assert any(name.startswith("source_") for name in metadata["input_names"])
+    assert metadata["output_names"] == ["audio"]
+    assert metadata["onnx_opset"] > 0
+    assert metadata["tensorrt_runtime_api"]["execute"] == "execute_async_v3"
 
     profile = metadata["profile"]
     assert profile["min_frames"] >= 1

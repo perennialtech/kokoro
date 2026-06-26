@@ -11,10 +11,11 @@ from .shapes import Profile
 CONFIG_FILENAME = "config.json"
 TRT_METADATA_FILENAME = "metadata.json"
 HOST_STATE_FILENAME = "host_state.pt"
-TRT_ENGINE_FILENAME = "generator_with_source_pyramid.pt2"
+TRT_ENGINE_FILENAME = "generator_with_source_pyramid.plan"
+ONNX_FILENAME = "generator_with_source_pyramid.onnx"
 
-ARTIFACT_TYPE = "kokoro_generator_with_source_pyramid_tensorrt"
-FORMAT_VERSION = 1
+ARTIFACT_TYPE = "kokoro_generator_with_source_pyramid_tensorrt_plan"
+FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,10 @@ class ArtifactPaths:
         return self.root / TRT_ENGINE_FILENAME
 
     @property
+    def onnx_path(self) -> Path:
+        return self.root / ONNX_FILENAME
+
+    @property
     def voice_dir(self) -> Path:
         return self.root / "voices"
 
@@ -47,6 +52,7 @@ class ArtifactMetadata:
     artifact_type: str
     format_version: int
     engine_file: str
+    onnx_file: str
     config_file: str
     host_state_file: str
     repo_id: str
@@ -58,6 +64,10 @@ class ArtifactMetadata:
     builder_optimization_level: Optional[int]
     profile: Profile
     shapes: dict[str, dict[str, tuple[int, ...]]]
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    onnx_opset: int
+    tensorrt_runtime_api: dict[str, Any]
 
     @classmethod
     def create(
@@ -72,11 +82,16 @@ class ArtifactMetadata:
         builder_optimization_level: Optional[int],
         profile: Profile,
         shapes: dict[str, dict[str, tuple[int, ...]]],
+        input_names: tuple[str, ...],
+        output_names: tuple[str, ...],
+        onnx_opset: int,
+        tensorrt_runtime_api: dict[str, Any],
     ) -> "ArtifactMetadata":
         metadata = cls(
             artifact_type=ARTIFACT_TYPE,
             format_version=FORMAT_VERSION,
             engine_file=TRT_ENGINE_FILENAME,
+            onnx_file=ONNX_FILENAME,
             config_file=CONFIG_FILENAME,
             host_state_file=HOST_STATE_FILENAME,
             repo_id=repo_id,
@@ -88,6 +103,10 @@ class ArtifactMetadata:
             builder_optimization_level=builder_optimization_level,
             profile=profile,
             shapes=shapes,
+            input_names=tuple(input_names),
+            output_names=tuple(output_names),
+            onnx_opset=int(onnx_opset),
+            tensorrt_runtime_api=dict(tensorrt_runtime_api),
         )
         metadata.validate()
         return metadata
@@ -98,6 +117,7 @@ class ArtifactMetadata:
             "artifact_type",
             "format_version",
             "engine_file",
+            "onnx_file",
             "config_file",
             "host_state_file",
             "repo_id",
@@ -107,6 +127,10 @@ class ArtifactMetadata:
             "precision",
             "profile",
             "shapes",
+            "input_names",
+            "output_names",
+            "onnx_opset",
+            "tensorrt_runtime_api",
         }
         missing = sorted(required - set(data))
         if missing:
@@ -119,6 +143,7 @@ class ArtifactMetadata:
             artifact_type=str(data["artifact_type"]),
             format_version=int(data["format_version"]),
             engine_file=str(data["engine_file"]),
+            onnx_file=str(data["onnx_file"]),
             config_file=str(data["config_file"]),
             host_state_file=str(data["host_state_file"]),
             repo_id=str(data["repo_id"]),
@@ -127,7 +152,9 @@ class ArtifactMetadata:
             versions=dict(data["versions"]),
             precision=str(data["precision"]).lower(),
             workspace_size=(
-                None if data.get("workspace_size") is None else int(data["workspace_size"])
+                None
+                if data.get("workspace_size") is None
+                else int(data["workspace_size"])
             ),
             builder_optimization_level=(
                 None
@@ -136,6 +163,10 @@ class ArtifactMetadata:
             ),
             profile=profile,
             shapes=shapes,
+            input_names=tuple(str(name) for name in data["input_names"]),
+            output_names=tuple(str(name) for name in data["output_names"]),
+            onnx_opset=int(data["onnx_opset"]),
+            tensorrt_runtime_api=dict(data["tensorrt_runtime_api"]),
         )
         metadata.validate()
         return metadata
@@ -190,6 +221,16 @@ class ArtifactMetadata:
             raise ValueError(
                 f"Unsupported engine_file {self.engine_file!r}; expected {TRT_ENGINE_FILENAME!r}"
             )
+        if not self.engine_file.endswith(".plan"):
+            raise ValueError(
+                "metadata.engine_file must be a native TensorRT .plan file"
+            )
+        if self.onnx_file != ONNX_FILENAME:
+            raise ValueError(
+                f"Unsupported onnx_file {self.onnx_file!r}; expected {ONNX_FILENAME!r}"
+            )
+        if not self.onnx_file.endswith(".onnx"):
+            raise ValueError("metadata.onnx_file must be an ONNX file")
         if self.config_file != CONFIG_FILENAME:
             raise ValueError(
                 f"Unsupported config_file {self.config_file!r}; expected {CONFIG_FILENAME!r}"
@@ -209,11 +250,39 @@ class ArtifactMetadata:
 
         self.profile.validate()
 
+        if not self.input_names:
+            raise ValueError("metadata.input_names must not be empty")
+        if len(set(self.input_names)) != len(self.input_names):
+            raise ValueError("metadata.input_names must be unique")
+        if self.input_names[0:2] != ("x", "ref_s"):
+            raise ValueError("metadata.input_names must start with x and ref_s")
+
+        source_names = tuple(
+            name for name in self.input_names if name.startswith("source_")
+        )
+        if not source_names:
+            raise ValueError("metadata.input_names must contain source_i inputs")
+
+        for group, specs in self.shapes.items():
+            missing = [name for name in self.input_names if name not in specs]
+            if missing:
+                raise ValueError(
+                    f"metadata.shapes.{group} is missing inputs: {missing}"
+                )
+
+        if self.output_names != ("audio",):
+            raise ValueError("metadata.output_names must be exactly ['audio']")
+        if self.onnx_opset <= 0:
+            raise ValueError("metadata.onnx_opset must be positive")
+        if not self.tensorrt_runtime_api:
+            raise ValueError("metadata.tensorrt_runtime_api must not be empty")
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "artifact_type": self.artifact_type,
             "format_version": self.format_version,
             "engine_file": self.engine_file,
+            "onnx_file": self.onnx_file,
             "config_file": self.config_file,
             "host_state_file": self.host_state_file,
             "repo_id": self.repo_id,
@@ -228,6 +297,10 @@ class ArtifactMetadata:
                 group: {name: list(shape) for name, shape in specs.items()}
                 for group, specs in self.shapes.items()
             },
+            "input_names": list(self.input_names),
+            "output_names": list(self.output_names),
+            "onnx_opset": self.onnx_opset,
+            "tensorrt_runtime_api": self.tensorrt_runtime_api,
         }
 
 
@@ -240,7 +313,9 @@ class TensorRTArtifact:
     def load(cls, root: Union[str, Path]) -> "TensorRTArtifact":
         paths = ArtifactPaths(Path(root))
         if not paths.metadata_path.is_file():
-            raise FileNotFoundError(f"Missing TensorRT artifact metadata: {paths.metadata_path}")
+            raise FileNotFoundError(
+                f"Missing TensorRT artifact metadata: {paths.metadata_path}"
+            )
 
         metadata = ArtifactMetadata.from_dict(load_json(paths.metadata_path))
         artifact = cls(paths=paths, metadata=metadata)
@@ -254,6 +329,7 @@ class TensorRTArtifact:
                 self.paths.config_path,
                 self.paths.host_state_path,
                 self.paths.engine_path,
+                self.paths.onnx_path,
             )
             if not path.is_file()
         ]

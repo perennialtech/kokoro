@@ -2,7 +2,8 @@ from typing import Any
 
 import torch
 
-from .types import END_SILENCE_FRAMES, KEEP_EOS_FRAMES, FrameItem, SynthesisResult
+from .types import (END_SILENCE_FRAMES, KEEP_EOS_FRAMES, FrameItem,
+                    SynthesisResult)
 
 
 def expand_frames(

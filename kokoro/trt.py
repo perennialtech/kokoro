@@ -5,6 +5,7 @@ import torch
 
 from .artifact import TensorRTArtifact
 from .model import KokoroHostStages, KokoroModelLoader
+from .native_trt import NativeTRTEngine
 from .pipeline import TextFrontend, VoiceStore, normalize_language_code
 from .runtime import synthesize_prepared_trt
 from .shapes import ShapePlan
@@ -39,16 +40,7 @@ class KokoroTRT:
 
         self.host = KokoroHostStages(model).to(self.device)
 
-        try:
-            import torch_tensorrt
-        except ImportError as e:
-            raise ImportError(
-                "KokoroTRT requires Torch-TensorRT >= 2.12.1 to load compiled engines. "
-                "Install Torch-TensorRT matching your PyTorch/CUDA stack."
-            ) from e
-
-        ep = torch_tensorrt.load(str(self.artifact.paths.engine_path))
-        self.generator = ep.module().to(self.device)
+        self.generator = NativeTRTEngine(self.artifact.paths.engine_path)
 
         self.decoder_dtype = (
             torch.float16 if self.metadata.precision == "fp16" else torch.float32
@@ -125,11 +117,17 @@ class KokoroTRT:
         source_pyramid: tuple[torch.Tensor, ...],
     ) -> torch.Tensor:
         dtype = self.decoder_dtype
-        return self.generator(
-            x.to(dtype=dtype),
-            ref_s.to(dtype=dtype),
-            *[source.to(dtype=dtype) for source in source_pyramid],
-        ).float()
+        inputs = {
+            "x": x.to(dtype=dtype).contiguous(),
+            "ref_s": ref_s.to(dtype=dtype).contiguous(),
+        }
+        inputs.update(
+            {
+                f"source_{i}": source.to(dtype=dtype).contiguous()
+                for i, source in enumerate(source_pyramid)
+            }
+        )
+        return self.generator.run(inputs)["audio"].float()
 
     def render_frame(self, frame_item: FrameItem, ref_s: torch.Tensor) -> torch.Tensor:
         synthesis_frames = int(frame_item.synthesis_frame_length)

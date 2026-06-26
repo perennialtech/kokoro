@@ -1,0 +1,116 @@
+import os
+from pathlib import Path
+
+import pytest
+import torch
+
+from kokoro import Profile, compile_artifact
+from kokoro.artifact import TensorRTArtifact
+from kokoro.model import GeneratorExportBuilder, KokoroModelLoader
+from kokoro.native_trt import NativeTRTEngine
+from kokoro.shapes import ShapePlan
+
+
+def existing_artifact_dir() -> Path:
+    value = os.getenv("KOKORO_TRT_ARTIFACT_DIR")
+    if not value:
+        pytest.skip("KOKORO_TRT_ARTIFACT_DIR is required")
+    return Path(value)
+
+
+def load_model_for_artifact(artifact: TensorRTArtifact):
+    loader = KokoroModelLoader(
+        repo_id=artifact.metadata.repo_id,
+        config=artifact.load_config(),
+        model=None,
+    )
+    model = loader.load(load_weights=False)
+    model.load_host_state(artifact.paths.host_state_path)
+    return model
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="native TensorRT tests require CUDA"
+)
+@pytest.mark.parametrize("precision", ["fp32", "fp16"])
+def test_native_compile_builds_artifact_and_metadata_loads(tmp_path, precision):
+    if os.getenv("KOKORO_NATIVE_TRT_BUILD_TESTS") != "1":
+        pytest.skip("set KOKORO_NATIVE_TRT_BUILD_TESTS=1 to run native compile tests")
+
+    output_dir = tmp_path / f"artifact-{precision}"
+    compile_artifact(
+        output_dir,
+        repo_id=os.getenv("KOKORO_TRT_REPO_ID", "hexgrad/Kokoro-82M"),
+        model=os.getenv("KOKORO_TRT_MODEL"),
+        precision=precision,
+        profile=Profile(min_frames=16, opt_frames=32, max_frames=64),
+        include_voices=[],
+    )
+
+    artifact = TensorRTArtifact.load(output_dir)
+    assert artifact.metadata.precision == precision
+    assert artifact.paths.engine_path.is_file()
+    assert artifact.paths.onnx_path.is_file()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="native TensorRT tests require CUDA"
+)
+def test_native_engine_runs_random_profile_points():
+    artifact = TensorRTArtifact.load(existing_artifact_dir())
+    engine = NativeTRTEngine(artifact.paths.engine_path)
+
+    for group in ("min", "opt", "max"):
+        inputs = {
+            name: torch.randn(
+                tuple(shape),
+                device="cuda",
+                dtype=(
+                    torch.float16
+                    if artifact.metadata.precision == "fp16"
+                    else torch.float32
+                ),
+            ).contiguous()
+            for name, shape in artifact.metadata.shapes[group].items()
+        }
+
+        outputs = engine.run(inputs)
+        assert set(outputs) == {"audio"}
+        assert outputs["audio"].is_cuda
+        assert outputs["audio"].numel() > 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="native TensorRT tests require CUDA"
+)
+def test_native_engine_matches_pytorch_generator_at_opt_shape():
+    artifact = TensorRTArtifact.load(existing_artifact_dir())
+    model = load_model_for_artifact(artifact).to("cuda").eval()
+    plan = ShapePlan.from_model(model, artifact.metadata.profile)
+    shapes = plan.profile_shapes(model)["opt"]
+
+    dtype = torch.float16 if artifact.metadata.precision == "fp16" else torch.float32
+    torch_generator = (
+        GeneratorExportBuilder.build(model).to(device="cuda", dtype=dtype).eval()
+    )
+    native_engine = NativeTRTEngine(artifact.paths.engine_path)
+
+    inputs = {
+        name: torch.randn(tuple(shapes[name]), device="cuda", dtype=dtype).contiguous()
+        for name in plan.input_order()
+    }
+
+    with torch.inference_mode():
+        expected = torch_generator(
+            inputs["x"],
+            inputs["ref_s"],
+            *(inputs[f"source_{i}"] for i in range(len(plan.source_channels))),
+        ).float()
+
+    actual = native_engine.run(inputs)["audio"].float()
+    torch.cuda.current_stream().synchronize()
+
+    if artifact.metadata.precision == "fp16":
+        assert torch.allclose(actual, expected, rtol=5e-2, atol=5e-2)
+    else:
+        assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3)

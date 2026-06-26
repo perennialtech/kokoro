@@ -10,13 +10,8 @@ from loguru import logger
 from torch.nn.utils import parametrize
 from transformers import AlbertConfig
 
-from .config import (
-    MODEL_FILENAMES,
-    get_context_length,
-    load_config_data,
-    resolve_model_path,
-    resolve_repo_id,
-)
+from .config import (MODEL_FILENAMES, get_context_length, load_config_data,
+                     resolve_model_path, resolve_repo_id)
 from .istftnet import Decoder, replace_conv_transpose1d_with_static_phase
 from .modules import CustomAlbert, ProsodyPredictor, TextEncoder
 
@@ -275,7 +270,9 @@ class GeneratorExportBuilder:
 
         replacements = replace_conv_transpose1d_with_static_phase(generator)
         remaining = sum(
-            1 for module in generator.modules() if isinstance(module, nn.ConvTranspose1d)
+            1
+            for module in generator.modules()
+            if isinstance(module, nn.ConvTranspose1d)
         )
         if remaining:
             raise RuntimeError(

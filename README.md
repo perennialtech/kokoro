@@ -1,6 +1,6 @@
 # kokoro
 
-TensorRT-first inference tooling for Kokoro-82M.
+Native TensorRT Runtime API inference tooling for Kokoro-82M.
 
 This fork has one supported public runtime:
 
@@ -14,7 +14,7 @@ The public compile API is:
 from kokoro import Profile, compile_artifact
 ```
 
-The supported Torch-TensorRT compiler API level is Torch-TensorRT >= 2.12.1.
+Artifacts contain a native TensorRT serialized plan loaded with `tensorrt.Runtime` and executed through `IExecutionContext.execute_async_v3`. Torch-TensorRT is not used.
 
 ## Install
 
@@ -24,7 +24,11 @@ cd kokoro
 uv sync
 ```
 
-Install TensorRT / Torch-TensorRT >= 2.12.1 matching your CUDA and PyTorch stack.
+Install TensorRT Python bindings matching your CUDA stack. ONNX export also requires `onnx` and `onnxscript`:
+
+```bash
+uv pip install ".[trt]"
+```
 
 You also need `espeak-ng`:
 
@@ -45,12 +49,8 @@ CLI:
 
 ```bash
 uv run python -m kokoro.compile \
-  --output-dir ./build \
+  --output-dir ./build \  
   --repo-id hexgrad/Kokoro-82M \
-  --precision fp16 \
-  --min-frames 16 \
-  --opt-frames 256 \
-  --max-frames 1024 \
   --include-voice af_heart
 ```
 
@@ -75,14 +75,17 @@ artifact/
   config.json
   host_state.pt
   metadata.json
-  generator_with_source_pyramid.pt2
+  generator_with_source_pyramid.plan
+  generator_with_source_pyramid.onnx
   voices/
     af_heart.pt
 ```
 
-TensorRT engines are profile-bound. If runtime predicts a synthesis frame length outside the compiled profile, synthesis raises a hard error. Recompile with a wider profile.
+TensorRT engines are profile-bound. If runtime predicts a synthesis frame length outside the compiled profile, synthesis raises a hard error before TensorRT execution. Recompile with a wider profile.
 
-## TensorRT inference: Python
+Compilation exports the generator boundary to ONNX and parses that ONNX with TensorRT. The compile step requires full TensorRT parser/operator coverage for the generator graph; parser errors are treated as hard failures.
+
+## Native TensorRT inference: Python
 
 ```python
 import soundfile as sf
@@ -102,7 +105,7 @@ for i, result in enumerate(
     sf.write(f"kokoro_trt_{i}.wav", result.audio.detach().cpu().numpy(), 24000)
 ```
 
-## TensorRT inference: CLI
+## Native TensorRT inference: CLI
 
 ```bash
 uv run kokoro \
@@ -139,6 +142,17 @@ uv run kokoro \
 ```python
 from kokoro import KokoroTRT, Profile, compile_artifact
 ```
+
+## Web UI
+
+A simple Gradio UI is provided in `app.py`. Install `gradio` and run:
+
+```bash
+uv pip install gradio
+uv run python app.py
+```
+
+By default it loads the artifact from `./build`. You can override this using the `KOKORO_TRT_ARTIFACT_DIR` environment variable.
 
 ## Tests
 

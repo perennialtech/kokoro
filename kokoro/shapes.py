@@ -92,9 +92,15 @@ class ShapePlan:
         input_channels = int(generator.ups[0].in_channels)
         source_channels = tuple(int(c) for c in generator.source_channels())
 
-        min_generator = int(model.decoder.generator_input_frame_length(profile.min_frames))
-        opt_generator = int(model.decoder.generator_input_frame_length(profile.opt_frames))
-        max_generator = int(model.decoder.generator_input_frame_length(profile.max_frames))
+        min_generator = int(
+            model.decoder.generator_input_frame_length(profile.min_frames)
+        )
+        opt_generator = int(
+            model.decoder.generator_input_frame_length(profile.opt_frames)
+        )
+        max_generator = int(
+            model.decoder.generator_input_frame_length(profile.max_frames)
+        )
         generator_points = (min_generator, opt_generator, max_generator)
 
         relations = tuple(
@@ -132,8 +138,12 @@ class ShapePlan:
         generator_frames = self.generator_frames(model, synthesis_frames)
         return int(model.decoder.generator.output_frame_length(generator_frames))
 
-    def source_lengths_from_generator_frames(self, generator_frames: int) -> tuple[int, ...]:
-        return tuple(relation.apply(generator_frames) for relation in self.source_relations)
+    def source_lengths_from_generator_frames(
+        self, generator_frames: int
+    ) -> tuple[int, ...]:
+        return tuple(
+            relation.apply(generator_frames) for relation in self.source_relations
+        )
 
     def source_lengths(self, model, synthesis_frames: int) -> tuple[int, ...]:
         return self.source_lengths_from_generator_frames(
@@ -220,7 +230,8 @@ class ShapePlan:
             "x": {2: generator_frames},
             "ref_s": None,
             "source_pyramid": tuple(
-                {2: relation.apply_dim(generator_frames)} for relation in self.source_relations
+                {2: relation.apply_dim(generator_frames)}
+                for relation in self.source_relations
             ),
         }
 
@@ -229,5 +240,8 @@ class ShapePlan:
         return (
             {2: generator_frames},
             {},
-            *({2: relation.apply_dim(generator_frames)} for relation in self.source_relations),
+            tuple(
+                {2: relation.apply_dim(generator_frames)}
+                for relation in self.source_relations
+            ),
         )

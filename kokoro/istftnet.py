@@ -440,14 +440,6 @@ class Generator(nn.Module):
             if i == self.num_upsamples - 1:
                 x = torch.cat([x[..., 1:2], x], dim=-1)
 
-            torch._assert(
-                x.shape[1] == x_source.shape[1],
-                "Generator source path channel count must match upsampled decoder path",
-            )
-            torch._assert(
-                x.shape[-1] == x_source.shape[-1],
-                "Generator source path length must match upsampled decoder path",
-            )
             x = x + x_source
 
             xs: Optional[torch.Tensor] = None
@@ -569,7 +561,9 @@ class StaticPhaseConvTranspose1d(nn.Module):
         else:
             self.register_buffer("bias", bias, persistent=False)
 
-    def _phase_conv1d_weight(self, weight: torch.Tensor, first_tap: int) -> torch.Tensor:
+    def _phase_conv1d_weight(
+        self, weight: torch.Tensor, first_tap: int
+    ) -> torch.Tensor:
         in_per_group = self.in_channels // self.groups
         out_per_group = self.out_channels // self.groups
 

@@ -39,7 +39,9 @@ def normalize_language_code(lang_code: str) -> str:
     return lang_code
 
 
-def infer_language_from_voice(language: Optional[str], voice: Union[str, torch.Tensor]) -> str:
+def infer_language_from_voice(
+    language: Optional[str], voice: Union[str, torch.Tensor]
+) -> str:
     if language:
         return normalize_language_code(language)
 
@@ -48,7 +50,9 @@ def infer_language_from_voice(language: Optional[str], voice: Union[str, torch.T
 
     stem = Path(voice).stem if voice.endswith(".pt") else voice
     if not stem:
-        raise ValueError("--language is required when language cannot be inferred from voice")
+        raise ValueError(
+            "--language is required when language cannot be inferred from voice"
+        )
 
     return normalize_language_code(stem[0])
 
@@ -108,7 +112,9 @@ class VoiceStore:
             return pack.view(-1, pack.shape[-1])
         return pack
 
-    def load_single_voice(self, voice: str, lang_code: Optional[str] = None) -> torch.Tensor:
+    def load_single_voice(
+        self, voice: str, lang_code: Optional[str] = None
+    ) -> torch.Tensor:
         if voice in self.cpu_cache:
             return self.cpu_cache[voice]
 
@@ -145,7 +151,9 @@ class VoiceStore:
         if not packs:
             raise ValueError("voice must not be empty")
 
-        self.cpu_cache[voice] = packs[0] if len(packs) == 1 else torch.mean(torch.stack(packs), dim=0)
+        self.cpu_cache[voice] = (
+            packs[0] if len(packs) == 1 else torch.mean(torch.stack(packs), dim=0)
+        )
         return self.cpu_cache[voice]
 
     def load(
@@ -159,7 +167,9 @@ class VoiceStore:
     ) -> torch.Tensor:
         base = self._load_cpu(voice, lang_code=lang_code, delimiter=delimiter)
 
-        target_device = torch.device(device) if device is not None else self.target_device
+        target_device = (
+            torch.device(device) if device is not None else self.target_device
+        )
         target_dtype = dtype or self.target_dtype
 
         if target_device is None and target_dtype is None:
@@ -199,7 +209,9 @@ class TextFrontend:
         en_callable: Optional[Callable[[str], str]] = None,
     ):
         if context_length <= 2:
-            raise ValueError(f"context_length must be greater than 2, got {context_length}")
+            raise ValueError(
+                f"context_length must be greater than 2, got {context_length}"
+            )
 
         self.repo_id = repo_id
         self.lang_code = normalize_language_code(lang_code)
@@ -227,7 +239,9 @@ class TextFrontend:
 
                 self.g2p = ja.JAG2P()
             except ImportError:
-                logger.error("You need to `pip install misaki[ja]` to use lang_code='j'")
+                logger.error(
+                    "You need to `pip install misaki[ja]` to use lang_code='j'"
+                )
                 raise
         elif self.lang_code == "z":
             try:
@@ -238,7 +252,9 @@ class TextFrontend:
                     en_callable=en_callable,
                 )
             except ImportError:
-                logger.error("You need to `pip install misaki[zh]` to use lang_code='z'")
+                logger.error(
+                    "You need to `pip install misaki[zh]` to use lang_code='z'"
+                )
                 raise
         else:
             language = LANGUAGE_CODES[self.lang_code]
@@ -363,7 +379,9 @@ class TextFrontend:
             text_index=text_index,
             input_ids=torch.tensor([[0, *ids, 0]], dtype=torch.long),
             ref_s=pack[ref_index].reshape(1, -1).contiguous(),
-            speed=torch.tensor([float(speed_value)], dtype=torch.float32, device=pack.device),
+            speed=torch.tensor(
+                [float(speed_value)], dtype=torch.float32, device=pack.device
+            ),
         )
 
     def prepare_from_tokens(
