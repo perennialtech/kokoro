@@ -9,6 +9,7 @@ from kokoro.artifact import TensorRTArtifact
 from kokoro.model import GeneratorExportBuilder, KokoroModelLoader
 from kokoro.native_trt import NativeTRTEngine
 from kokoro.shapes import ShapePlan
+from kokoro.telemetry import InMemoryTraceSink, ProfilerConfig, Telemetry
 
 
 def existing_artifact_dir() -> Path:
@@ -59,8 +60,11 @@ def test_native_compile_builds_artifact_and_metadata_loads(tmp_path, precision):
 def test_native_engine_runs_random_profile_points():
     artifact = TensorRTArtifact.load(existing_artifact_dir())
     engine = NativeTRTEngine(artifact.paths.engine_path)
+    sink = InMemoryTraceSink()
+    telemetry = Telemetry(ProfilerConfig(enabled=True), [sink])
 
     for group in ("min", "opt", "max"):
+        chunk = telemetry.start_chunk()
         inputs = {
             name: torch.randn(
                 tuple(shape),
@@ -74,10 +78,19 @@ def test_native_engine_runs_random_profile_points():
             for name, shape in artifact.metadata.shapes[group].items()
         }
 
-        outputs = engine.run(inputs)
+        outputs = engine.run(inputs, profile=chunk)
+        chunk.finalize("ok")
         assert set(outputs) == {"audio"}
         assert outputs["audio"].is_cuda
         assert outputs["audio"].numel() > 0
+
+    stage_names = {stage.name for trace in sink.traces for stage in trace.stages}
+    assert "trt.validate_inputs" in stage_names
+    assert "trt.set_input_shapes" in stage_names
+    assert "trt.infer_shapes" in stage_names
+    assert "trt.allocate_outputs" in stage_names
+    assert "trt.set_tensor_addresses" in stage_names
+    assert "trt.execute_async_v3" in stage_names
 
 
 @pytest.mark.skipif(

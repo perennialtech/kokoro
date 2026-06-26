@@ -4,11 +4,14 @@ from typing import Generator, Optional, Union
 import torch
 
 from .artifact import TensorRTArtifact
+from .exceptions import OutOfProfileError
 from .model import KokoroHostStages, KokoroModelLoader
 from .native_trt import NativeTRTEngine
 from .pipeline import TextFrontend, VoiceStore, normalize_language_code
 from .runtime import synthesize_prepared_trt
 from .shapes import ShapePlan
+from .telemetry import (NoOpProfileContext, ProfileContext, Telemetry,
+                        shape_attr, tensor_nbytes)
 from .types import FrameItem, SynthesisResult
 
 
@@ -18,13 +21,16 @@ class KokoroTRT:
         artifact_dir: Union[str, Path],
         voice_dir: Optional[Union[str, Path]] = None,
         verify_internal_shapes: bool = False,
+        telemetry: Optional[Telemetry] = None,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("KokoroTRT requires CUDA")
 
+        self.telemetry = telemetry or Telemetry()
         self.artifact = TensorRTArtifact.load(artifact_dir)
         self.artifact.validate_gpu()
         self.metadata = self.artifact.metadata
+        self.telemetry.register_runtime(self.metadata)
 
         self.device = torch.device("cuda")
         self.verify_internal_shapes = bool(verify_internal_shapes)
@@ -39,7 +45,6 @@ class KokoroTRT:
         model.load_host_state(self.artifact.paths.host_state_path)
 
         self.host = KokoroHostStages(model).to(self.device)
-
         self.generator = NativeTRTEngine(self.artifact.paths.engine_path)
 
         self.decoder_dtype = (
@@ -82,16 +87,22 @@ class KokoroTRT:
         language: str,
         speed: float = 1.0,
         split_pattern: Optional[str] = r"\n+",
+        profile: Optional[ProfileContext] = None,
     ):
         yield from self.frontend(language).prepare(
             text=text,
             voice=voice,
             speed=speed,
             split_pattern=split_pattern,
+            profile=profile,
         )
 
-    def synthesize_prepared(self, prepared) -> SynthesisResult:
-        return synthesize_prepared_trt(self, prepared)
+    def synthesize_prepared(
+        self,
+        prepared,
+        profile: Optional[ProfileContext] = None,
+    ) -> SynthesisResult:
+        return synthesize_prepared_trt(self, prepared, profile=profile)
 
     def synthesize(
         self,
@@ -101,67 +112,162 @@ class KokoroTRT:
         speed: float = 1.0,
         split_pattern: Optional[str] = r"\n+",
     ) -> Generator[SynthesisResult, None, None]:
-        for prepared in self.prepare(
-            text=text,
-            voice=voice,
+        request = self.telemetry.start_request(
             language=language,
+            voice=voice,
             speed=speed,
-            split_pattern=split_pattern,
-        ):
-            yield self.synthesize_prepared(prepared)
+            input_chars=(
+                sum(len(x) for x in text) if isinstance(text, list) else len(text)
+            ),
+            precision=self.metadata.precision,
+        )
+        status = "cancelled"
+        error: BaseException | None = None
+
+        try:
+            for prepared in self.prepare(
+                text=text,
+                voice=voice,
+                language=language,
+                speed=speed,
+                split_pattern=split_pattern,
+                profile=request,
+            ):
+                yield self.synthesize_prepared(prepared, profile=request)
+            status = "ok"
+        except GeneratorExit:
+            status = "cancelled"
+            raise
+        except Exception as e:
+            status = "error"
+            error = e
+            raise
+        finally:
+            request.finalize(status, error)
 
     def _generate_with_trt(
         self,
         x: torch.Tensor,
         ref_s: torch.Tensor,
         source_pyramid: tuple[torch.Tensor, ...],
+        profile: Optional[ProfileContext] = None,
     ) -> torch.Tensor:
+        profile = profile or NoOpProfileContext()
         dtype = self.decoder_dtype
-        inputs = {
-            "x": x.to(dtype=dtype).contiguous(),
-            "ref_s": ref_s.to(dtype=dtype).contiguous(),
-        }
-        inputs.update(
-            {
-                f"source_{i}": source.to(dtype=dtype).contiguous()
-                for i, source in enumerate(source_pyramid)
-            }
-        )
-        return self.generator.run(inputs)["audio"].float()
 
-    def render_frame(self, frame_item: FrameItem, ref_s: torch.Tensor) -> torch.Tensor:
-        synthesis_frames = int(frame_item.synthesis_frame_length)
-        if (
-            synthesis_frames < self.min_synthesis_frames
-            or synthesis_frames > self.max_synthesis_frames
+        with profile.span(
+            "trt.prepare_inputs",
+            attrs={
+                "precision": self.metadata.precision,
+                "source_count": len(source_pyramid),
+            },
         ):
-            raise RuntimeError(
-                "Predicted synthesis frame length "
-                f"{synthesis_frames} is outside the TensorRT profile "
-                f"[{self.min_synthesis_frames}, {self.max_synthesis_frames}]. "
-                "Recompile with a wider --min-frames/--max-frames profile."
+            raw_inputs = {"x": x, "ref_s": ref_s}
+            raw_inputs.update(
+                {f"source_{i}": source for i, source in enumerate(source_pyramid)}
             )
+
+        with profile.span("trt.input_cast", cuda=True) as span:
+            inputs = {
+                name: tensor.to(dtype=dtype).contiguous()
+                for name, tensor in raw_inputs.items()
+            }
+            total_input_bytes = 0
+            for name, tensor in inputs.items():
+                nbytes = tensor_nbytes(tensor)
+                total_input_bytes += nbytes
+                span.attrs[f"{name}.shape"] = shape_attr(tensor)
+                span.attrs[f"{name}.dtype"] = str(tensor.dtype)
+                span.attrs[f"{name}.bytes"] = nbytes
+            span.attrs["input_bytes"] = total_input_bytes
+            profile.histogram("trt_input_bytes", float(total_input_bytes), {})
+
+        with profile.span("trt.run", cuda=True):
+            outputs = self.generator.run(inputs, profile=profile)
+
+        with profile.span("trt.output_cast", cuda=True) as span:
+            audio = outputs["audio"].float()
+            span.attrs["audio.shape"] = shape_attr(audio)
+            span.attrs["audio.bytes"] = tensor_nbytes(audio)
+            return audio
+
+    def render_frame(
+        self,
+        frame_item: FrameItem,
+        ref_s: torch.Tensor,
+        profile: Optional[ProfileContext] = None,
+    ) -> torch.Tensor:
+        profile = profile or NoOpProfileContext()
+        synthesis_frames = int(frame_item.synthesis_frame_length)
+
+        with profile.span("runtime.profile_check") as span:
+            span.attrs.update(
+                {
+                    "synthesis_frames": synthesis_frames,
+                    "profile_min_frames": self.min_synthesis_frames,
+                    "profile_max_frames": self.max_synthesis_frames,
+                }
+            )
+            if (
+                synthesis_frames < self.min_synthesis_frames
+                or synthesis_frames > self.max_synthesis_frames
+            ):
+                profile.counter(
+                    "out_of_profile_total",
+                    1,
+                    (
+                        {
+                            "language": profile._base_labels().get("language", ""),
+                            "precision": self.metadata.precision,
+                        }
+                        if hasattr(profile, "_base_labels")
+                        else {"language": "", "precision": self.metadata.precision}
+                    ),
+                )
+                raise OutOfProfileError(
+                    "Predicted synthesis frame length "
+                    f"{synthesis_frames} is outside the TensorRT profile "
+                    f"[{self.min_synthesis_frames}, {self.max_synthesis_frames}]. "
+                    "Recompile with a wider --min-frames/--max-frames profile."
+                )
 
         asr = frame_item.asr.unsqueeze(0).to(self.device)
         en = frame_item.en.unsqueeze(0).to(self.device)
         ref_s = ref_s.to(self.device, dtype=torch.float32)
 
-        f0, n = self.host.predict_f0n(en, ref_s)
-        har = self.host.compute_harmonic_features(f0)
-        source_pyramid = self.host.compute_source_pyramid(har, ref_s)
-        decoded = self.host.decode_features(asr, f0, n, ref_s)
+        with profile.span("host.predict_f0n", cuda=True) as span:
+            f0, n = self.host.predict_f0n(en, ref_s)
+            span.attrs["f0.shape"] = shape_attr(f0)
+            span.attrs["noise.shape"] = shape_attr(n)
+
+        with profile.span("host.compute_harmonic_features", cuda=True) as span:
+            har = self.host.compute_harmonic_features(f0)
+            span.attrs["har.shape"] = shape_attr(har)
+
+        with profile.span("host.compute_source_pyramid", cuda=True) as span:
+            source_pyramid = self.host.compute_source_pyramid(har, ref_s)
+            for i, source in enumerate(source_pyramid):
+                span.attrs[f"source_{i}.shape"] = shape_attr(source)
+
+        with profile.span("host.decode_features", cuda=True) as span:
+            decoded = self.host.decode_features(asr, f0, n, ref_s)
+            span.attrs["decoded.shape"] = shape_attr(decoded)
 
         if self.verify_internal_shapes:
-            self._verify_internal_contract(
-                synthesis_frames=synthesis_frames,
-                f0=f0,
-                noise=n,
-                har=har,
-                source_pyramid=source_pyramid,
-                decoded=decoded,
-            )
+            with profile.span("runtime.verify_internal_shapes"):
+                self._verify_internal_contract(
+                    synthesis_frames=synthesis_frames,
+                    f0=f0,
+                    noise=n,
+                    har=har,
+                    source_pyramid=source_pyramid,
+                    decoded=decoded,
+                )
 
-        return self._generate_with_trt(decoded, ref_s, source_pyramid)
+        with profile.span("trt.generator", cuda=True):
+            return self._generate_with_trt(
+                decoded, ref_s, source_pyramid, profile=profile
+            )
 
     def _verify_internal_contract(
         self,

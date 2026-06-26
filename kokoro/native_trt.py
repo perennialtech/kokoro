@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import torch
+
+from .exceptions import (TensorRTDeserializationError, TensorRTExecutionError,
+                         TensorRTShapeError)
+from .telemetry import (NoOpProfileContext, ProfileContext, shape_attr,
+                        tensor_nbytes)
 
 
 def trt_dtype_to_torch(dtype) -> torch.dtype:
@@ -46,15 +52,20 @@ class NativeTRTEngine:
         runtime = trt.Runtime(self.logger)
         engine = runtime.deserialize_cuda_engine(plan)
         if engine is None:
-            raise RuntimeError(f"Failed to deserialize TensorRT plan: {engine_path}")
+            raise TensorRTDeserializationError(
+                f"Failed to deserialize TensorRT plan: {engine_path}"
+            )
 
         context = engine.create_execution_context()
         if context is None:
-            raise RuntimeError("Failed to create TensorRT execution context")
+            raise TensorRTDeserializationError(
+                "Failed to create TensorRT execution context"
+            )
 
         self.runtime = runtime
         self.engine = engine
         self.context = context
+        self._lock = threading.Lock()
 
         self.tensor_names: tuple[str, ...] = tuple(
             engine.get_tensor_name(i) for i in range(engine.num_io_tensors)
@@ -79,57 +90,128 @@ class NativeTRTEngine:
         )
 
         if not self.input_names:
-            raise RuntimeError("TensorRT engine has no inputs")
+            raise TensorRTDeserializationError("TensorRT engine has no inputs")
         if not self.output_names:
-            raise RuntimeError("TensorRT engine has no outputs")
+            raise TensorRTDeserializationError("TensorRT engine has no outputs")
 
-    def run(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        missing = [name for name in self.input_names if name not in inputs]
-        if missing:
-            raise ValueError(f"Missing TensorRT input tensors: {missing}")
+    def run(
+        self,
+        inputs: dict[str, torch.Tensor],
+        profile: Optional[ProfileContext] = None,
+    ) -> dict[str, torch.Tensor]:
+        profile = profile or NoOpProfileContext()
 
-        for name in self.input_names:
-            tensor = inputs[name]
-            if not tensor.is_cuda:
-                raise ValueError(f"TensorRT input {name!r} must be a CUDA tensor")
-            if not tensor.is_contiguous():
-                raise ValueError(f"TensorRT input {name!r} must be contiguous")
+        with profile.span(
+            "trt.validate_inputs",
+            attrs={
+                "input_names": ",".join(self.input_names),
+                "output_names": ",".join(self.output_names),
+            },
+        ):
+            missing = [name for name in self.input_names if name not in inputs]
+            if missing:
+                raise ValueError(f"Missing TensorRT input tensors: {missing}")
 
-            if not self.context.set_input_shape(name, tuple(tensor.shape)):
-                raise RuntimeError(
-                    f"TensorRT rejected input shape for {name!r}: {tuple(tensor.shape)}"
-                )
+            for name in self.input_names:
+                tensor = inputs[name]
+                if not tensor.is_cuda:
+                    raise ValueError(f"TensorRT input {name!r} must be a CUDA tensor")
+                if not tensor.is_contiguous():
+                    raise ValueError(f"TensorRT input {name!r} must be contiguous")
 
-        infer_shapes = getattr(self.context, "infer_shapes", None)
-        if infer_shapes is not None:
-            unresolved = infer_shapes()
-            if unresolved:
-                raise RuntimeError(
-                    "TensorRT could not infer all tensor shapes; unresolved tensors: "
-                    f"{list(unresolved)}"
-                )
+        with profile.span("trt.context_wait"):
+            self._lock.acquire()
 
-        outputs: dict[str, torch.Tensor] = {}
-        for name in self.output_names:
-            shape = tuple(int(dim) for dim in self.context.get_tensor_shape(name))
-            if any(dim < 0 for dim in shape):
-                raise RuntimeError(
-                    f"TensorRT output {name!r} has unresolved shape {shape}"
-                )
+        try:
+            with profile.span("trt.set_input_shapes") as span:
+                for name in self.input_names:
+                    tensor = inputs[name]
+                    span.attrs[f"{name}.shape"] = shape_attr(tensor)
+                    span.attrs[f"{name}.dtype"] = str(tensor.dtype)
+                    span.attrs[f"{name}.bytes"] = tensor_nbytes(tensor)
+                    if not self.context.set_input_shape(name, tuple(tensor.shape)):
+                        raise TensorRTShapeError(
+                            f"TensorRT rejected input shape for {name!r}: {tuple(tensor.shape)}"
+                        )
 
-            outputs[name] = torch.empty(
-                shape,
-                device="cuda",
-                dtype=self.tensor_dtypes[name],
+            with profile.span("trt.infer_shapes") as span:
+                infer_shapes = getattr(self.context, "infer_shapes", None)
+                span.attrs["available"] = infer_shapes is not None
+                if infer_shapes is not None:
+                    unresolved = infer_shapes()
+                    if unresolved:
+                        span.attrs["unresolved"] = ",".join(str(x) for x in unresolved)
+                        raise TensorRTShapeError(
+                            "TensorRT could not infer all tensor shapes; unresolved tensors: "
+                            f"{list(unresolved)}"
+                        )
+
+            outputs: dict[str, torch.Tensor] = {}
+            with profile.span("trt.allocate_outputs") as span:
+                total_output_bytes = 0
+                for name in self.output_names:
+                    shape = tuple(
+                        int(dim) for dim in self.context.get_tensor_shape(name)
+                    )
+                    if any(dim < 0 for dim in shape):
+                        raise TensorRTShapeError(
+                            f"TensorRT output {name!r} has unresolved shape {shape}"
+                        )
+
+                    outputs[name] = torch.empty(
+                        shape,
+                        device="cuda",
+                        dtype=self.tensor_dtypes[name],
+                    )
+                    nbytes = tensor_nbytes(outputs[name])
+                    total_output_bytes += nbytes
+                    span.attrs[f"{name}.shape"] = shape_attr(outputs[name])
+                    span.attrs[f"{name}.dtype"] = str(outputs[name].dtype)
+                    span.attrs[f"{name}.bytes"] = nbytes
+                span.attrs["output_bytes"] = total_output_bytes
+                profile.histogram("trt_output_bytes", float(total_output_bytes), {})
+
+            with profile.span("trt.set_tensor_addresses"):
+                for name in self.input_names:
+                    self.context.set_tensor_address(name, int(inputs[name].data_ptr()))
+                for name, tensor in outputs.items():
+                    self.context.set_tensor_address(name, int(tensor.data_ptr()))
+
+            stream = torch.cuda.current_stream().cuda_stream
+            with profile.span(
+                "trt.execute_async_v3",
+                cuda=True,
+                attrs={"stream": int(stream)},
+            ):
+                if not self.context.execute_async_v3(stream_handle=stream):
+                    raise TensorRTExecutionError("TensorRT execute_async_v3 failed")
+
+            profile.counter(
+                "trt_executions_total",
+                1,
+                (
+                    {
+                        "precision": profile._base_labels().get("precision", ""),
+                        "status": "ok",
+                    }
+                    if hasattr(profile, "_base_labels")
+                    else {"precision": "", "status": "ok"}
+                ),
             )
-
-        for name in self.input_names:
-            self.context.set_tensor_address(name, int(inputs[name].data_ptr()))
-        for name, tensor in outputs.items():
-            self.context.set_tensor_address(name, int(tensor.data_ptr()))
-
-        stream = torch.cuda.current_stream().cuda_stream
-        if not self.context.execute_async_v3(stream_handle=stream):
-            raise RuntimeError("TensorRT execute_async_v3 failed")
-
-        return outputs
+            return outputs
+        except Exception:
+            profile.counter(
+                "trt_executions_total",
+                1,
+                (
+                    {
+                        "precision": profile._base_labels().get("precision", ""),
+                        "status": "error",
+                    }
+                    if hasattr(profile, "_base_labels")
+                    else {"precision": "", "status": "error"}
+                ),
+            )
+            raise
+        finally:
+            self._lock.release()

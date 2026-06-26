@@ -56,3 +56,6 @@ Repository = "https://github.com/hexgrad/kokoro"
 ui = [
     "gradio>=6.19.0",
 ]
+metrics = [
+    "prometheus-client>=0.25.0",
+]

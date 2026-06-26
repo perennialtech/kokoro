@@ -3,6 +3,8 @@ from typing import Optional
 
 import torch
 
+from .telemetry import ChunkTrace
+
 END_SILENCE_FRAMES = 5
 KEEP_EOS_FRAMES = 1
 
@@ -26,3 +28,4 @@ class SynthesisResult:
     sample_length: int
     graphemes: Optional[str] = None
     phonemes: Optional[str] = None
+    profile: Optional[ChunkTrace] = None
