@@ -65,6 +65,7 @@ class NativeTRTEngine:
         self.runtime = runtime
         self.engine = engine
         self.context = context
+        self.stream = torch.cuda.Stream()
         self._lock = threading.Lock()
 
         self.tensor_names: tuple[str, ...] = tuple(
@@ -177,14 +178,21 @@ class NativeTRTEngine:
                 for name, tensor in outputs.items():
                     self.context.set_tensor_address(name, int(tensor.data_ptr()))
 
-            stream = torch.cuda.current_stream().cuda_stream
-            with profile.span(
-                "trt.execute_async_v3",
-                cuda=True,
-                attrs={"stream": int(stream)},
-            ):
-                if not self.context.execute_async_v3(stream_handle=stream):
-                    raise TensorRTExecutionError("TensorRT execute_async_v3 failed")
+            current_stream = torch.cuda.current_stream()
+            self.stream.wait_stream(current_stream)
+
+            with torch.cuda.stream(self.stream):
+                with profile.span(
+                    "trt.execute_async_v3",
+                    cuda=True,
+                    attrs={"stream": int(self.stream.cuda_stream)},
+                ):
+                    if not self.context.execute_async_v3(
+                        stream_handle=self.stream.cuda_stream
+                    ):
+                        raise TensorRTExecutionError("TensorRT execute_async_v3 failed")
+
+            current_stream.wait_stream(self.stream)
 
             profile.counter(
                 "trt_executions_total",
