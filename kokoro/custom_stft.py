@@ -113,6 +113,10 @@ class CustomSTFT(nn.Module):
 
         magnitude = torch.sqrt(real.square() + imag.square() + 1e-14)
         phase = torch.atan2(imag, real)
+
+        correction_mask = (imag == 0) & (real < 0)
+        phase[correction_mask] = torch.pi
+
         return magnitude, phase
 
     def inverse(

@@ -64,7 +64,8 @@ def read_input(args, profile) -> str:
             return args.text
         if args.input_file:
             return args.input_file.read_text()
-        print("Press Ctrl+D to stop reading input and start generating", flush=True)
+        if sys.stdin.isatty():
+            print("Press Ctrl+D to stop reading input and start generating", flush=True)
         return "".join(sys.stdin)
 
 

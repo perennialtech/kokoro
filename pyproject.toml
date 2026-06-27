@@ -27,7 +27,8 @@ dependencies = [
     "onnxscript>=0.7.0",
     "tensorrt>=10.16.1.11",
     "torch",
-    "transformers"
+    "transformers",
+    "triton>=3.7.1",
 ]
 
 [project.scripts]

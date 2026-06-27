@@ -7,6 +7,7 @@ from torch.nn.utils.parametrizations import weight_norm
 from transformers import AlbertModel
 
 from .istftnet import AdainResBlk1d
+from .my_lstm import MyLSTM
 
 Nonlinearity: TypeAlias = Literal[
     "linear",
@@ -80,13 +81,14 @@ class TextEncoder(nn.Module):
                 for _ in range(depth)
             ]
         )
-        self.lstm = nn.LSTM(
+        raw_lstm = nn.LSTM(
             channels,
             channels // 2,
             1,
             batch_first=True,
             bidirectional=True,
         )
+        self.lstm = MyLSTM(raw_lstm, max_length=512)
 
     def forward(self, x):
         x = self.embedding(x).transpose(1, 2)
@@ -94,8 +96,6 @@ class TextEncoder(nn.Module):
             x = c(x)
 
         x = x.transpose(1, 2)
-        if not torch.jit.is_scripting():
-            self.lstm.flatten_parameters()
         x, _ = self.lstm(x)
         return x
 
@@ -126,21 +126,23 @@ class ProsodyPredictor(nn.Module):
             nlayers=nlayers,
             dropout=dropout,
         )
-        self.lstm = nn.LSTM(
+        raw_lstm = nn.LSTM(
             d_hid + style_dim,
             d_hid // 2,
             1,
             batch_first=True,
             bidirectional=True,
         )
+        self.lstm = MyLSTM(raw_lstm, max_length=512)
         self.duration_proj = LinearNorm(d_hid, max_dur)
-        self.shared = nn.LSTM(
+        raw_shared = nn.LSTM(
             d_hid + style_dim,
             d_hid // 2,
             1,
             batch_first=True,
             bidirectional=True,
         )
+        self.shared = MyLSTM(raw_shared, max_length=512)
 
         self.F0 = nn.ModuleList(
             [
@@ -174,8 +176,6 @@ class ProsodyPredictor(nn.Module):
     def forward(self, texts, style, alignment):
         d = self.text_encoder(texts, style)
 
-        if not torch.jit.is_scripting():
-            self.lstm.flatten_parameters()
         x, _ = self.lstm(d)
 
         duration = self.duration_proj(F.dropout(x, 0.5, training=False))
@@ -184,8 +184,6 @@ class ProsodyPredictor(nn.Module):
 
     def F0Ntrain(self, x, s):
         x = x.transpose(-1, -2)
-        if not torch.jit.is_scripting():
-            self.shared.flatten_parameters()
         x, _ = self.shared(x)
         x = x.transpose(-1, -2)
 
@@ -207,15 +205,14 @@ class DurationEncoder(nn.Module):
         super().__init__()
         self.lstms = nn.ModuleList()
         for _ in range(nlayers):
-            self.lstms.append(
-                nn.LSTM(
-                    d_model + sty_dim,
-                    d_model // 2,
-                    1,
-                    batch_first=True,
-                    bidirectional=True,
-                )
+            raw_lstm = nn.LSTM(
+                d_model + sty_dim,
+                d_model // 2,
+                1,
+                batch_first=True,
+                bidirectional=True,
             )
+            self.lstms.append(MyLSTM(raw_lstm, max_length=512))
             self.lstms.append(AdaLayerNorm(sty_dim, d_model))
         self.dropout = dropout
         self.d_model = d_model
@@ -230,10 +227,8 @@ class DurationEncoder(nn.Module):
                 x = block(x.transpose(-1, -2), style).transpose(-1, -2)
                 style_time = style.unsqueeze(-1).expand(-1, -1, x.shape[-1])
                 x = torch.cat([x, style_time], dim=1)
-            elif isinstance(block, nn.LSTM):
+            elif isinstance(block, MyLSTM):
                 x_time = x.transpose(-1, -2)
-                if not torch.jit.is_scripting():
-                    block.flatten_parameters()
                 x_time, _ = block(x_time)
                 x = F.dropout(
                     x_time,

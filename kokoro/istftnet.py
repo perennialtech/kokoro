@@ -160,11 +160,25 @@ class AdaINResBlock1(nn.Module):
             self.alpha2,
         ):
             xt = n1(x, s)
-            xt = xt + (1 / a1) * torch.sin(a1 * xt).square()
+
+            xt_f32 = xt.to(torch.float32)
+            a1_f32 = a1.to(torch.float32)
+            xt = (xt_f32 + (1 / a1_f32) * torch.sin(a1_f32 * xt_f32).square()).to(
+                xt.dtype
+            )
+
             xt = c1(xt)
+
             xt = n2(xt, s)
-            xt = xt + (1 / a2) * torch.sin(a2 * xt).square()
+
+            xt_f32 = xt.to(torch.float32)
+            a2_f32 = a2.to(torch.float32)
+            xt = (xt_f32 + (1 / a2_f32) * torch.sin(a2_f32 * xt_f32).square()).to(
+                xt.dtype
+            )
+
             x = c2(xt) + x
+
         return x
 
 

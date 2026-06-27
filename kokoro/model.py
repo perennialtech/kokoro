@@ -211,8 +211,6 @@ class KokoroHostStages(torch.nn.Module):
         duration_style = ref_s[:, 128:]
         duration_hidden = model.predictor.text_encoder(d_en, duration_style)
 
-        if not torch.jit.is_scripting():
-            model.predictor.lstm.flatten_parameters()
         x, _ = model.predictor.lstm(duration_hidden)
 
         duration = torch.sigmoid(model.predictor.duration_proj(x)).sum(dim=-1)

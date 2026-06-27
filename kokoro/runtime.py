@@ -130,6 +130,32 @@ def synthesize_prepared_trt(
         chunk.trace.synthesis_frames = frame_item.synthesis_frame_length
         chunk.trace.return_frames = frame_item.return_frame_length
 
+        tokens = getattr(prepared, "tokens", None)
+        if tokens and len(frame_item.pred_dur) >= 3:
+            MAGIC_DIVISOR = 80
+            left = right = 2 * max(0, frame_item.pred_dur[0].item() - 3)
+
+            i = 1
+            for t in tokens:
+                if i >= len(frame_item.pred_dur) - 1:
+                    break
+                if not t.phonemes:
+                    if t.whitespace:
+                        i += 1
+                        left = right + frame_item.pred_dur[i].item()
+                        right = left + frame_item.pred_dur[i].item()
+                        i += 1
+                    continue
+
+                j = i + len(t.phonemes)
+                t.start_ts = left / MAGIC_DIVISOR
+                token_dur = frame_item.pred_dur[i:j].sum().item()
+                space_dur = frame_item.pred_dur[j].item() if t.whitespace else 0
+                left = right + (2 * token_dur) + space_dur
+                t.end_ts = left / MAGIC_DIVISOR
+                right = left + space_dur
+                i = j + (1 if t.whitespace else 0)
+
         with chunk.span("runtime.render_frame", cuda=True):
             audio = tts.render_frame(frame_item, ref_s, profile=chunk)
 
@@ -169,6 +195,7 @@ def synthesize_prepared_trt(
             sample_length=sample_length,
             graphemes=getattr(prepared, "graphemes", None),
             phonemes=getattr(prepared, "phonemes", None),
+            tokens=getattr(prepared, "tokens", None),
             profile=chunk.trace,
         )
     except Exception as e:

@@ -28,4 +28,5 @@ class SynthesisResult:
     sample_length: int
     graphemes: Optional[str] = None
     phonemes: Optional[str] = None
+    tokens: Optional[list] = None
     profile: Optional[ChunkTrace] = None

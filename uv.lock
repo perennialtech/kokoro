@@ -957,6 +957,7 @@ dependencies = [
     { name = "tensorrt" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton" },
 ]
 
 [package.optional-dependencies]
@@ -992,6 +993,7 @@ requires-dist = [
     { name = "tensorrt", specifier = ">=10.16.1.11" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton", specifier = ">=3.7.1" },
 ]
 provides-extras = ["ui", "metrics"]
 
