@@ -956,6 +956,7 @@ dependencies = [
     { name = "onnxscript" },
     { name = "tensorrt" },
     { name = "torch" },
+    { name = "torchvision" },
     { name = "transformers" },
     { name = "triton" },
 ]
@@ -976,7 +977,6 @@ dev = [
     { name = "nvidia-modelopt" },
     { name = "pytest" },
     { name = "ruff" },
-    { name = "torchvision" },
 ]
 
 [package.metadata]
@@ -992,6 +992,7 @@ requires-dist = [
     { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.25.0" },
     { name = "tensorrt", specifier = ">=10.16.1.11" },
     { name = "torch" },
+    { name = "torchvision", specifier = ">=0.27.1" },
     { name = "transformers" },
     { name = "triton", specifier = ">=3.7.1" },
 ]
@@ -1005,7 +1006,6 @@ dev = [
     { name = "nvidia-modelopt", specifier = ">=0.44.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.15.19" },
-    { name = "torchvision", specifier = ">=0.27.1" },
 ]
 
 [[package]]

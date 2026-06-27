@@ -27,6 +27,7 @@ dependencies = [
     "onnxscript>=0.7.0",
     "tensorrt>=10.16.1.11",
     "torch",
+    "torchvision>=0.27.1",
     "transformers",
     "triton>=3.7.1",
 ]
@@ -46,7 +47,6 @@ dev = [
     "nvidia-modelopt>=0.44.0",
     "pytest>=9.1.1",
     "ruff>=0.15.19",
-    "torchvision>=0.27.1",
 ]
 
 [project.urls]
