@@ -7,7 +7,7 @@ from torch.nn.utils.parametrizations import weight_norm
 from transformers import AlbertModel
 
 from .istftnet import AdainResBlk1d
-from .my_lstm import MyLSTM
+from .my_lstm import FastGraphBiLSTM
 
 Nonlinearity: TypeAlias = Literal[
     "linear",
@@ -88,7 +88,7 @@ class TextEncoder(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
-        self.lstm = MyLSTM(raw_lstm, max_length=512)
+        self.lstm = FastGraphBiLSTM(raw_lstm, max_seq_len=512)
 
     def forward(self, x):
         x = self.embedding(x).transpose(1, 2)
@@ -133,7 +133,7 @@ class ProsodyPredictor(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
-        self.lstm = MyLSTM(raw_lstm, max_length=512)
+        self.lstm = FastGraphBiLSTM(raw_lstm, max_seq_len=512)
         self.duration_proj = LinearNorm(d_hid, max_dur)
         raw_shared = nn.LSTM(
             d_hid + style_dim,
@@ -142,7 +142,7 @@ class ProsodyPredictor(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
-        self.shared = MyLSTM(raw_shared, max_length=512)
+        self.shared = FastGraphBiLSTM(raw_shared, max_seq_len=512)
 
         self.F0 = nn.ModuleList(
             [
@@ -212,7 +212,7 @@ class DurationEncoder(nn.Module):
                 batch_first=True,
                 bidirectional=True,
             )
-            self.lstms.append(MyLSTM(raw_lstm, max_length=512))
+            self.lstms.append(FastGraphBiLSTM(raw_lstm, max_seq_len=512))
             self.lstms.append(AdaLayerNorm(sty_dim, d_model))
         self.dropout = dropout
         self.d_model = d_model
@@ -227,7 +227,7 @@ class DurationEncoder(nn.Module):
                 x = block(x.transpose(-1, -2), style).transpose(-1, -2)
                 style_time = style.unsqueeze(-1).expand(-1, -1, x.shape[-1])
                 x = torch.cat([x, style_time], dim=1)
-            elif isinstance(block, MyLSTM):
+            elif isinstance(block, FastGraphBiLSTM):
                 x_time = x.transpose(-1, -2)
                 x_time, _ = block(x_time)
                 x = F.dropout(

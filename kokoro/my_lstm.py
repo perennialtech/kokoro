@@ -5,732 +5,551 @@ from torch import Tensor, nn
 from triton.language.extra import libdevice
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            dict(TILE_N=TILE_N, TILE_K=TILE_K),
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for TILE_N in [8, 16, 32]
+        for TILE_K in [32, 64, 128]
+        for num_warps in [4, 8]
+        for num_stages in [3, 4, 5]
+    ],
+    key=["hidden_dim"],
+)
 @triton.jit
-def lstm_triton_step_kernel(
-    X_ptr,  # (max_length, 1, input_dim), fp32
+def _lstm_recurrent_from_gates_kernel(
+    Gates_ptr,  # (max_seq_len, hidden_dim * 8)
     C_ptr,  # (hidden_dim * 2), fp32
-    Y_ptr,  # (max_length, 1, hidden_dim * 2), fp32
-    weight_ih_ptr,  # (hidden_dim * 4, input_dim)
-    weight_hh_ptr,  # (hidden_dim * 4, hidden_dim)
-    bias_ptr,  # (hidden_dim * 4), fp32
-    weight_ih_reverse_ptr,  # (hidden_dim * 4, input_dim)
-    weight_hh_reverse_ptr,  # (hidden_dim * 4, hidden_dim)
-    bias_reverse_ptr,  # (hidden_dim * 4), fp32
-    base_time_ptr,  # scalar int32
-    length_ptr,  # scalar int32
-    local_step,
-    input_dim: tl.constexpr,
+    Y_ptr,  # (max_seq_len, hidden_dim * 2), fp32
+    Whh_ptr,  # (hidden_dim * 8, hidden_dim)
+    Bias_ptr,  # (hidden_dim * 8), fp32
+    base_ptr,  # int32 scalar
+    length_ptr,  # int32 scalar
+    local_step,  # runtime scalar, graph node parameter
     hidden_dim: tl.constexpr,
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
 ):
-    # One program computes one tile of hidden units for one direction.
-    #
-    # program_id(0): hidden tile
-    # program_id(1): direction, 0 forward, 1 reverse
-    #
-    # Batch size is intentionally fixed to 1 by the Python module.
     pid_n = tl.program_id(0)
-    is_reverse = tl.program_id(1)
+    direction = tl.program_id(1)
 
-    base_time = tl.load(base_time_ptr)
-    length = tl.load(length_ptr)
-    time = base_time + local_step
+    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+    mask_n = offs_n < hidden_dim
 
-    offsets_n = pid_n * TILE_N + tl.arange(0, TILE_N)
-    offsets_k = tl.arange(0, TILE_K)
-    mask_n = offsets_n < hidden_dim
+    base = tl.load(base_ptr)
+    L = tl.load(length_ptr)
+    logical_t = base + local_step
 
-    if is_reverse == 0:
-        seq_t = time
-        direction_offset = 0
-        prev_hidden_delta = -hidden_dim * 2
-
-        wih_ptr = weight_ih_ptr
-        whh_ptr = weight_hh_ptr
-        b_ptr = bias_ptr
+    # direction 0: forward
+    # direction 1: reverse
+    if direction == 0:
+        seq_t = logical_t
+        gate_dir_offset = 0
+        out_dir_offset = 0
+        c_dir_offset = 0
+        prev_seq_t = seq_t - 1
     else:
-        seq_t = length - 1 - time
-        direction_offset = hidden_dim
-        prev_hidden_delta = hidden_dim * 2
+        seq_t = L - 1 - logical_t
+        gate_dir_offset = 4 * hidden_dim
+        out_dir_offset = hidden_dim
+        c_dir_offset = hidden_dim
+        prev_seq_t = seq_t + 1
 
-        wih_ptr = weight_ih_reverse_ptr
-        whh_ptr = weight_hh_reverse_ptr
-        b_ptr = bias_reverse_ptr
+    gates_row = Gates_ptr + seq_t * (8 * hidden_dim) + gate_dir_offset
+    bias_base = direction * 4 * hidden_dim
+    whh_base = direction * 4 * hidden_dim * hidden_dim
 
-    x_base = X_ptr + seq_t * input_dim
-    y_base = Y_ptr + seq_t * hidden_dim * 2 + direction_offset
-    h_prev_base = y_base + prev_hidden_delta
-    c_base = C_ptr + direction_offset
+    i = tl.load(gates_row + 0 * hidden_dim + offs_n, mask=mask_n, other=0.0).to(
+        tl.float32
+    )
+    f = tl.load(gates_row + 1 * hidden_dim + offs_n, mask=mask_n, other=0.0).to(
+        tl.float32
+    )
+    g = tl.load(gates_row + 2 * hidden_dim + offs_n, mask=mask_n, other=0.0).to(
+        tl.float32
+    )
+    o = tl.load(gates_row + 3 * hidden_dim + offs_n, mask=mask_n, other=0.0).to(
+        tl.float32
+    )
 
-    i_gate = tl.zeros((TILE_N,), dtype=tl.float32)
-    f_gate = tl.zeros((TILE_N,), dtype=tl.float32)
-    g_gate = tl.zeros((TILE_N,), dtype=tl.float32)
-    o_gate = tl.zeros((TILE_N,), dtype=tl.float32)
+    i += tl.load(
+        Bias_ptr + bias_base + 0 * hidden_dim + offs_n, mask=mask_n, other=0.0
+    ).to(tl.float32)
+    f += tl.load(
+        Bias_ptr + bias_base + 1 * hidden_dim + offs_n, mask=mask_n, other=0.0
+    ).to(tl.float32)
+    g += tl.load(
+        Bias_ptr + bias_base + 2 * hidden_dim + offs_n, mask=mask_n, other=0.0
+    ).to(tl.float32)
+    o += tl.load(
+        Bias_ptr + bias_base + 3 * hidden_dim + offs_n, mask=mask_n, other=0.0
+    ).to(tl.float32)
 
-    # Input projection:
-    #
-    # weight_ih is stored as:
-    #   [W_ii]
-    #   [W_if]
-    #   [W_ig]
-    #   [W_io]
-    #
-    # Each gate matrix has shape (hidden_dim, input_dim).
-    for k0 in range(0, input_dim, TILE_K):
-        k = k0 + offsets_k
-        mask_k = k < input_dim
+    if logical_t > 0:
+        offs_k = tl.arange(0, TILE_K)
 
-        x = tl.load(x_base + k, mask=mask_k, other=0.0).to(tl.float32)
+        prev_h_base = Y_ptr + prev_seq_t * (2 * hidden_dim) + out_dir_offset
 
-        weight_offsets = offsets_n[:, None] * input_dim + k[None, :]
-        weight_mask = mask_n[:, None] & mask_k[None, :]
-
-        w_i = tl.load(
-            wih_ptr + hidden_dim * input_dim * 0 + weight_offsets,
-            mask=weight_mask,
-            other=0.0,
-        ).to(tl.float32)
-        w_f = tl.load(
-            wih_ptr + hidden_dim * input_dim * 1 + weight_offsets,
-            mask=weight_mask,
-            other=0.0,
-        ).to(tl.float32)
-        w_g = tl.load(
-            wih_ptr + hidden_dim * input_dim * 2 + weight_offsets,
-            mask=weight_mask,
-            other=0.0,
-        ).to(tl.float32)
-        w_o = tl.load(
-            wih_ptr + hidden_dim * input_dim * 3 + weight_offsets,
-            mask=weight_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        i_gate += tl.sum(w_i * x[None, :], axis=1)
-        f_gate += tl.sum(w_f * x[None, :], axis=1)
-        g_gate += tl.sum(w_g * x[None, :], axis=1)
-        o_gate += tl.sum(w_o * x[None, :], axis=1)
-
-    # Recurrent projection.
-    #
-    # At time == 0, the initial hidden state is defined as zero, so the
-    # recurrent contribution is skipped instead of reading a sentinel buffer.
-    if time > 0:
         for k0 in range(0, hidden_dim, TILE_K):
-            k = k0 + offsets_k
+            k = k0 + offs_k
             mask_k = k < hidden_dim
 
-            h_prev = tl.load(
-                h_prev_base + k,
-                mask=mask_k,
-                other=0.0,
-            ).to(tl.float32)
+            h_prev = tl.load(prev_h_base + k, mask=mask_k, other=0.0).to(tl.float32)
 
-            weight_offsets = offsets_n[:, None] * hidden_dim + k[None, :]
-            weight_mask = mask_n[:, None] & mask_k[None, :]
+            whh_i = (
+                Whh_ptr
+                + whh_base
+                + 0 * hidden_dim * hidden_dim
+                + offs_n[:, None] * hidden_dim
+                + k[None, :]
+            )
+            whh_f = (
+                Whh_ptr
+                + whh_base
+                + 1 * hidden_dim * hidden_dim
+                + offs_n[:, None] * hidden_dim
+                + k[None, :]
+            )
+            whh_g = (
+                Whh_ptr
+                + whh_base
+                + 2 * hidden_dim * hidden_dim
+                + offs_n[:, None] * hidden_dim
+                + k[None, :]
+            )
+            whh_o = (
+                Whh_ptr
+                + whh_base
+                + 3 * hidden_dim * hidden_dim
+                + offs_n[:, None] * hidden_dim
+                + k[None, :]
+            )
 
-            w_i = tl.load(
-                whh_ptr + hidden_dim * hidden_dim * 0 + weight_offsets,
-                mask=weight_mask,
-                other=0.0,
-            ).to(tl.float32)
-            w_f = tl.load(
-                whh_ptr + hidden_dim * hidden_dim * 1 + weight_offsets,
-                mask=weight_mask,
-                other=0.0,
-            ).to(tl.float32)
-            w_g = tl.load(
-                whh_ptr + hidden_dim * hidden_dim * 2 + weight_offsets,
-                mask=weight_mask,
-                other=0.0,
-            ).to(tl.float32)
-            w_o = tl.load(
-                whh_ptr + hidden_dim * hidden_dim * 3 + weight_offsets,
-                mask=weight_mask,
-                other=0.0,
-            ).to(tl.float32)
+            mask_nk = mask_n[:, None] & mask_k[None, :]
 
-            i_gate += tl.sum(w_i * h_prev[None, :], axis=1)
-            f_gate += tl.sum(w_f * h_prev[None, :], axis=1)
-            g_gate += tl.sum(w_g * h_prev[None, :], axis=1)
-            o_gate += tl.sum(w_o * h_prev[None, :], axis=1)
+            wi = tl.load(whh_i, mask=mask_nk, other=0.0).to(tl.float32)
+            wf = tl.load(whh_f, mask=mask_nk, other=0.0).to(tl.float32)
+            wg = tl.load(whh_g, mask=mask_nk, other=0.0).to(tl.float32)
+            wo = tl.load(whh_o, mask=mask_nk, other=0.0).to(tl.float32)
 
-    i_gate += tl.load(
-        b_ptr + hidden_dim * 0 + offsets_n,
-        mask=mask_n,
-        other=0.0,
-    ).to(tl.float32)
-    f_gate += tl.load(
-        b_ptr + hidden_dim * 1 + offsets_n,
-        mask=mask_n,
-        other=0.0,
-    ).to(tl.float32)
-    g_gate += tl.load(
-        b_ptr + hidden_dim * 2 + offsets_n,
-        mask=mask_n,
-        other=0.0,
-    ).to(tl.float32)
-    o_gate += tl.load(
-        b_ptr + hidden_dim * 3 + offsets_n,
-        mask=mask_n,
-        other=0.0,
-    ).to(tl.float32)
+            i += tl.sum(wi * h_prev[None, :], axis=1)
+            f += tl.sum(wf * h_prev[None, :], axis=1)
+            g += tl.sum(wg * h_prev[None, :], axis=1)
+            o += tl.sum(wo * h_prev[None, :], axis=1)
 
-    c_prev = tl.load(c_base + offsets_n, mask=mask_n, other=0.0).to(tl.float32)
-
-    c = tl.sigmoid(f_gate) * c_prev + tl.sigmoid(i_gate) * libdevice.tanh(g_gate)
-    h = tl.sigmoid(o_gate) * libdevice.tanh(c)
-
-    tl.store(c_base + offsets_n, c, mask=mask_n)
-    tl.store(y_base + offsets_n, h, mask=mask_n)
-
-
-def _is_power_of_two(x: int) -> bool:
-    return x > 0 and (x & (x - 1)) == 0
-
-
-def _powers_of_two_descending(max_length: int) -> list[int]:
-    p = 1 << (max_length.bit_length() - 1)
-    lengths: list[int] = []
-    while p > 0:
-        lengths.append(p)
-        p >>= 1
-    return lengths
-
-
-def _default_tile_n(hidden_dim: int) -> int:
-    return 32 if hidden_dim >= 128 else 16
-
-
-def _default_tile_k(input_dim: int, hidden_dim: int) -> int:
-    return 64 if max(input_dim, hidden_dim) >= 64 else 32
-
-
-def lstm_triton(
-    x: Tensor,
-    c: Tensor,
-    out: Tensor,
-    weights: list[Tensor],
-    base_time: Tensor,
-    length: Tensor,
-    num_steps: int,
-    input_dim: int,
-    hidden_dim: int,
-    tile_n: int,
-    tile_k: int,
-    num_warps: int,
-    num_stages: int,
-) -> Tensor:
-    grid = (triton.cdiv(hidden_dim, tile_n), 2)
-
-    for local_step in range(num_steps):
-        lstm_triton_step_kernel[grid](
-            x,
-            c,
-            out,
-            weights[0],
-            weights[1],
-            weights[2],
-            weights[3],
-            weights[4],
-            weights[5],
-            base_time,
-            length,
-            local_step,
-            input_dim,
-            hidden_dim,
-            TILE_N=tile_n,
-            TILE_K=tile_k,
-            num_warps=num_warps,
-            num_stages=num_stages,
+    if logical_t == 0:
+        c_prev = tl.zeros((TILE_N,), dtype=tl.float32)
+    else:
+        c_prev = tl.load(C_ptr + c_dir_offset + offs_n, mask=mask_n, other=0.0).to(
+            tl.float32
         )
 
-    return out
+    c_new = tl.sigmoid(f) * c_prev + tl.sigmoid(i) * libdevice.tanh(g)
+    h_new = tl.sigmoid(o) * libdevice.tanh(c_new)
+
+    tl.store(C_ptr + c_dir_offset + offs_n, c_new, mask=mask_n)
+    tl.store(
+        Y_ptr + seq_t * (2 * hidden_dim) + out_dir_offset + offs_n, h_new, mask=mask_n
+    )
 
 
-class MyLSTM(nn.Module):
+@triton.jit
+def _advance_base_kernel(base_ptr, amount: tl.constexpr):
+    base = tl.load(base_ptr)
+    tl.store(base_ptr, base + amount)
+
+
+@triton.jit
+def _reset_base_length_kernel(base_ptr, length_ptr, L):
+    tl.store(base_ptr, 0)
+    tl.store(length_ptr, L)
+
+
+class FastGraphBiLSTM(nn.Module):
     """
-    CUDA-graph inference replacement for a narrow but common LSTM case:
+    Inference-only bidirectional single-layer LSTM for B == 1.
 
-    - one layer
-    - bidirectional
-    - bias enabled
-    - no projection
-    - batch size exactly 1
-    - zero initial hidden and cell state
-    - CUDA inference only
-
-    The implementation computes internally in fp32, returns output and state in
-    the input dtype, and returns independent cloned tensors so later calls do not
-    mutate previously returned outputs.
-
-    Unlike the original version, this implementation does not mutate a global
-    time counter from inside the Triton grid. Each captured graph chunk receives
-    a dynamic base timestep through device memory, and each kernel node has a
-    fixed local step. This avoids the unsafe intra-kernel race caused by trying
-    to update time_ptr from one program while other programs in the same launch
-    might not have loaded it yet.
+    Main design:
+    - precompute all input gates with one GEMM
+    - run recurrent hidden-to-hidden work with graph-captured Triton chunks
+    - use dynamic base + local graph step instead of racing on time_ptr
     """
 
     def __init__(
         self,
         lstm: nn.LSTM,
-        max_length: int = 512,
-        *,
-        tile_n: int | None = None,
-        tile_k: int | None = None,
-        num_warps: int = 4,
-        num_stages: int = 4,
+        max_seq_len: int,
+        compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
 
-        if not isinstance(max_length, int) or max_length <= 0:
-            raise ValueError("max_length must be a positive integer")
-
         if lstm.num_layers != 1:
-            raise ValueError("MyLSTM only supports num_layers == 1")
-
+            raise ValueError("FastGraphBiLSTM only supports num_layers == 1")
         if not lstm.bidirectional:
-            raise ValueError("MyLSTM only supports bidirectional LSTMs")
-
+            raise ValueError("FastGraphBiLSTM only supports bidirectional LSTMs")
         if not lstm.bias:
-            raise ValueError("MyLSTM requires bias=True")
-
+            raise ValueError("FastGraphBiLSTM requires bias=True")
         if getattr(lstm, "proj_size", 0) != 0:
-            raise ValueError("MyLSTM does not support projection LSTMs")
+            raise ValueError("FastGraphBiLSTM does not support projection LSTMs")
+        if max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
 
-        if tile_n is not None and not _is_power_of_two(tile_n):
-            raise ValueError("tile_n must be a positive power of two")
-
-        if tile_k is not None and not _is_power_of_two(tile_k):
-            raise ValueError("tile_k must be a positive power of two")
-
-        if num_warps not in (1, 2, 4, 8, 16, 32):
-            raise ValueError("num_warps must be one of 1, 2, 4, 8, 16, or 32")
-
-        if not isinstance(num_stages, int) or num_stages <= 0:
-            raise ValueError("num_stages must be a positive integer")
-
-        self.max_length = max_length
         self.batch_first = lstm.batch_first
-        self.tile_n = tile_n
-        self.tile_k = tile_k
-        self.num_warps = num_warps
-        self.num_stages = num_stages
+        self.max_seq_len = int(max_seq_len)
 
-        for name in (
-            "weight_ih_l0",
-            "weight_hh_l0",
-            "bias_ih_l0",
-            "bias_hh_l0",
-            "weight_ih_l0_reverse",
-            "weight_hh_l0_reverse",
-            "bias_ih_l0_reverse",
-            "bias_hh_l0_reverse",
-        ):
-            value = getattr(lstm, name).detach().clone().contiguous()
-            self.register_buffer(name, value)
+        self.input_dim = lstm.weight_ih_l0.shape[1]
+        self.hidden_dim = lstm.weight_hh_l0.shape[1]
 
-        self._validate_weight_shapes()
+        # NOTE: PyTorch conventionally loads state/modules on CPU first, before invoking `.to("cuda")`.
+        # Do not check device.type != "cuda" at this point.
+        device = lstm.weight_ih_l0.device
 
-        self.register_buffer("_x", None, persistent=False)
-        self.register_buffer("_c", None, persistent=False)
-        self.register_buffer("_out", None, persistent=False)
-        self.register_buffer("_bias", None, persistent=False)
-        self.register_buffer("_bias_reverse", None, persistent=False)
-        self.register_buffer("_base_time", None, persistent=False)
-        self.register_buffer("_length", None, persistent=False)
+        if compute_dtype is None:
+            compute_dtype = lstm.weight_ih_l0.dtype
 
-        self._graphs: list[tuple[int, torch.cuda.CUDAGraph]] | None = None
-        self._captured_signature = None
-
-    @property
-    def input_size(self) -> int:
-        return int(self.weight_ih_l0.shape[1])
-
-    @property
-    def hidden_size(self) -> int:
-        return int(self.weight_hh_l0.shape[1])
-
-    def _apply(self, fn):
-        # Moving or dtype-converting a module invalidates any captured CUDA graph,
-        # because graph nodes contain concrete device pointers.
-        self.reset_cuda_graphs()
-        return super()._apply(fn)
-
-    def reset_cuda_graphs(self) -> None:
-        self._graphs = None
-        self._captured_signature = None
-
-    def _validate_weight_shapes(self) -> None:
-        input_dim = int(self.weight_ih_l0.shape[1])
-        hidden_dim = int(self.weight_hh_l0.shape[1])
-
-        expected_wih = (hidden_dim * 4, input_dim)
-        expected_whh = (hidden_dim * 4, hidden_dim)
-        expected_bias = (hidden_dim * 4,)
-
-        tensors_and_shapes = (
-            (self.weight_ih_l0, expected_wih, "weight_ih_l0"),
-            (self.weight_hh_l0, expected_whh, "weight_hh_l0"),
-            (self.bias_ih_l0, expected_bias, "bias_ih_l0"),
-            (self.bias_hh_l0, expected_bias, "bias_hh_l0"),
-            (self.weight_ih_l0_reverse, expected_wih, "weight_ih_l0_reverse"),
-            (self.weight_hh_l0_reverse, expected_whh, "weight_hh_l0_reverse"),
-            (self.bias_ih_l0_reverse, expected_bias, "bias_ih_l0_reverse"),
-            (self.bias_hh_l0_reverse, expected_bias, "bias_hh_l0_reverse"),
-        )
-
-        for tensor, expected_shape, name in tensors_and_shapes:
-            if tuple(tensor.shape) != expected_shape:
-                raise ValueError(
-                    f"{name} has shape {tuple(tensor.shape)}, expected {expected_shape}"
-                )
-
-            if not tensor.is_floating_point():
-                raise ValueError(f"{name} must be a floating point tensor")
-
-            if not tensor.is_contiguous():
-                raise ValueError(f"{name} must be contiguous")
-
-    def _runtime_tiles(self) -> tuple[int, int]:
-        input_dim = self.input_size
-        hidden_dim = self.hidden_size
-
-        tile_n = self.tile_n if self.tile_n is not None else _default_tile_n(hidden_dim)
-        tile_k = (
-            self.tile_k
-            if self.tile_k is not None
-            else _default_tile_k(
-                input_dim,
-                hidden_dim,
+        # Input projection weight:
+        #   original PyTorch: W_ih_fwd, W_ih_rev are (4H, I)
+        #   packed GEMM form: W_ih_t is (I, 8H)
+        w_ih_cat = (
+            torch.cat(
+                [
+                    lstm.weight_ih_l0.detach(),
+                    lstm.weight_ih_l0_reverse.detach(),
+                ],
+                dim=0,
             )
+            .to(device=device, dtype=compute_dtype)
+            .contiguous()
         )
 
-        return tile_n, tile_k
+        w_ih_t = w_ih_cat.t().contiguous()
 
-    def _graph_signature(self):
-        tensors = (
-            self.weight_ih_l0,
-            self.weight_hh_l0,
-            self.bias_ih_l0,
-            self.bias_hh_l0,
-            self.weight_ih_l0_reverse,
-            self.weight_hh_l0_reverse,
-            self.bias_ih_l0_reverse,
-            self.bias_hh_l0_reverse,
-            self._x,
-            self._c,
-            self._out,
-            self._bias,
-            self._bias_reverse,
-            self._base_time,
-            self._length,
-        )
-
-        tensor_signature = tuple(
-            (
-                None
-                if t is None
-                else (
-                    str(t.device),
-                    t.dtype,
-                    tuple(t.shape),
-                    tuple(t.stride()),
-                    t.data_ptr(),
-                )
+        # Recurrent projection weight:
+        #   packed as (8H, H)
+        w_hh_cat = (
+            torch.cat(
+                [
+                    lstm.weight_hh_l0.detach(),
+                    lstm.weight_hh_l0_reverse.detach(),
+                ],
+                dim=0,
             )
-            for t in tensors
+            .to(device=device, dtype=compute_dtype)
+            .contiguous()
         )
 
-        return (
-            self.max_length,
-            self.input_size,
-            self.hidden_size,
-            self._runtime_tiles(),
-            self.num_warps,
-            self.num_stages,
-            tensor_signature,
+        # Combined PyTorch biases:
+        #   bias = bias_ih + bias_hh
+        bias_fwd = (lstm.bias_ih_l0.detach() + lstm.bias_hh_l0.detach()).to(
+            device=device,
+            dtype=torch.float32,
+        )
+        bias_rev = (
+            lstm.bias_ih_l0_reverse.detach() + lstm.bias_hh_l0_reverse.detach()
+        ).to(
+            device=device,
+            dtype=torch.float32,
+        )
+        bias_cat = torch.cat([bias_fwd, bias_rev], dim=0).contiguous()
+
+        self.register_buffer("w_ih_t", w_ih_t, persistent=True)
+        self.register_buffer("w_hh_cat", w_hh_cat, persistent=True)
+        self.register_buffer("bias_cat", bias_cat, persistent=True)
+
+        self._runtime_allocated = False
+        self.graphs: list[tuple[int, torch.cuda.CUDAGraph]] | None = None
+
+        graph_lengths = []
+        p = 1
+        while p <= self.max_seq_len:
+            graph_lengths.append(p)
+            p *= 2
+        self.graph_lengths = tuple(reversed(graph_lengths))
+
+    def _ensure_runtime_buffers(self):
+        if self._runtime_allocated:
+            return
+
+        device = self.w_hh_cat.device
+        H = self.hidden_dim
+        I = self.input_dim
+        max_seq_len = self.max_seq_len
+
+        self.register_buffer(
+            "_gates_x",
+            torch.empty(
+                (max_seq_len, 8 * H),
+                device=device,
+                dtype=self.w_ih_t.dtype,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_x2d_contiguous",
+            torch.empty(
+                (max_seq_len, I),
+                device=device,
+                dtype=self.w_ih_t.dtype,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_c",
+            torch.empty(
+                (2 * H,),
+                device=device,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_out",
+            torch.empty(
+                (max_seq_len, 2 * H),
+                device=device,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_base",
+            torch.empty((1,), device=device, dtype=torch.int32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_length",
+            torch.empty((1,), device=device, dtype=torch.int32),
+            persistent=False,
         )
 
-    def _allocate_static_buffers(self) -> None:
-        device = self.weight_ih_l0.device
-        input_dim = self.input_size
-        hidden_dim = self.hidden_size
+        self._runtime_allocated = True
 
-        self._x = torch.empty(
-            (self.max_length, 1, input_dim),
-            device=device,
-            dtype=torch.float32,
-        )
-        self._c = torch.empty(
-            (hidden_dim * 2,),
-            device=device,
-            dtype=torch.float32,
-        )
-        self._out = torch.empty(
-            (self.max_length, 1, hidden_dim * 2),
-            device=device,
-            dtype=torch.float32,
-        )
-        self._bias = torch.empty(
-            (hidden_dim * 4,),
-            device=device,
-            dtype=torch.float32,
-        )
-        self._bias_reverse = torch.empty(
-            (hidden_dim * 4,),
-            device=device,
-            dtype=torch.float32,
-        )
-        self._base_time = torch.empty(
-            (1,),
-            device=device,
-            dtype=torch.int32,
-        )
-        self._length = torch.empty(
-            (1,),
-            device=device,
-            dtype=torch.int32,
-        )
+    def _grid(self):
+        H = self.hidden_dim
+        return lambda meta: (triton.cdiv(H, meta["TILE_N"]), 2)
 
-        self._x.zero_()
-        self._c.zero_()
-        self._out.zero_()
-        self._base_time.zero_()
-        self._length.zero_()
+    def _emit_recurrent_chunk(self, n: int):
+        grid = self._grid()
+        H = self.hidden_dim
+
+        for local_step in range(n):
+            _lstm_recurrent_from_gates_kernel[grid](
+                self._gates_x,
+                self._c,
+                self._out,
+                self.w_hh_cat,
+                self.bias_cat,
+                self._base,
+                self._length,
+                local_step,
+                H,
+            )
+
+        _advance_base_kernel[(1,)](self._base, n)
 
     @torch.inference_mode()
-    def _refresh_combined_biases(self) -> None:
-        torch.add(self.bias_ih_l0, self.bias_hh_l0, out=self._bias)
-        torch.add(
-            self.bias_ih_l0_reverse,
-            self.bias_hh_l0_reverse,
-            out=self._bias_reverse,
-        )
+    def _capture_graphs(self):
+        self._ensure_runtime_buffers()
 
-    def _weights_for_kernel(self) -> list[Tensor]:
-        return [
-            self.weight_ih_l0,
-            self.weight_hh_l0,
-            self._bias,
-            self.weight_ih_l0_reverse,
-            self.weight_hh_l0_reverse,
-            self._bias_reverse,
-        ]
+        H = self.hidden_dim
+        grid = self._grid()
 
-    def _check_cuda_ready(self) -> None:
-        self._validate_weight_shapes()
+        current_stream = torch.cuda.current_stream()
+        warmup_stream = torch.cuda.Stream()
 
-        tensors = (
-            self.weight_ih_l0,
-            self.weight_hh_l0,
-            self.bias_ih_l0,
-            self.bias_hh_l0,
-            self.weight_ih_l0_reverse,
-            self.weight_hh_l0_reverse,
-            self.bias_ih_l0_reverse,
-            self.bias_hh_l0_reverse,
-        )
+        warmup_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warmup_stream):
+            self._gates_x.zero_()
+            self._out.zero_()
 
-        device = tensors[0].device
+            # Warm recurrent path with logical_t > 0.
+            # This forces autotuning to benchmark the real recurrent dot-product path,
+            # not the cheap time-zero path.
+            self._base.fill_(1)
+            self._length.fill_(self.max_seq_len)
 
-        if not device.type == "cuda":
-            raise RuntimeError(
-                "MyLSTM requires CUDA tensors. Move the module to CUDA first."
+            _lstm_recurrent_from_gates_kernel[grid](
+                self._gates_x,
+                self._c,
+                self._out,
+                self.w_hh_cat,
+                self.bias_cat,
+                self._base,
+                self._length,
+                0,
+                H,
             )
 
-        for tensor in tensors:
-            if tensor.device != device:
-                raise RuntimeError(
-                    "all LSTM weights and biases must be on the same device"
-                )
+            _reset_base_length_kernel[(1,)](
+                self._base,
+                self._length,
+                self.max_seq_len,
+            )
 
-            if not tensor.is_contiguous():
-                raise RuntimeError("all LSTM weights and biases must be contiguous")
+            for n in self.graph_lengths:
+                _advance_base_kernel[(1,)](self._base, n)
 
-    @torch.inference_mode()
-    def _capture_graphs(self) -> None:
-        self._check_cuda_ready()
-        self._allocate_static_buffers()
-        self._refresh_combined_biases()
-
-        input_dim = self.input_size
-        hidden_dim = self.hidden_size
-        tile_n, tile_k = self._runtime_tiles()
-        weights = self._weights_for_kernel()
-        graph_lengths = _powers_of_two_descending(self.max_length)
-
-        device = self.weight_ih_l0.device
-        current_stream = torch.cuda.current_stream(device)
-        warmup_stream = torch.cuda.Stream(device=device)
+        current_stream.wait_stream(warmup_stream)
 
         graphs: list[tuple[int, torch.cuda.CUDAGraph]] = []
 
-        for graph_length in graph_lengths:
-            self._length.fill_(self.max_length)
+        for n in self.graph_lengths:
+            self._base.zero_()
+            self._length.fill_(self.max_seq_len)
 
-            warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream):
-                for _ in range(2):
-                    self._c.zero_()
-                    self._out.zero_()
-                    self._base_time.zero_()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._emit_recurrent_chunk(n)
 
-                    lstm_triton(
-                        self._x,
-                        self._c,
-                        self._out,
-                        weights,
-                        self._base_time,
-                        self._length,
-                        graph_length,
-                        input_dim,
-                        hidden_dim,
-                        tile_n,
-                        tile_k,
-                        self.num_warps,
-                        self.num_stages,
+            graphs.append((n, g))
+
+        self.graphs = graphs
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        has_fastgraph_keys = any(k.startswith(prefix + "w_ih_t") for k in state_dict)
+        if not has_fastgraph_keys:
+            w_ih_fwd_key = prefix + "weight_ih_l0"
+            if w_ih_fwd_key in state_dict:
+                keys = [
+                    w_ih_fwd_key,
+                    prefix + "weight_ih_l0_reverse",
+                    prefix + "weight_hh_l0",
+                    prefix + "weight_hh_l0_reverse",
+                    prefix + "bias_ih_l0",
+                    prefix + "bias_ih_l0_reverse",
+                    prefix + "bias_hh_l0",
+                    prefix + "bias_hh_l0_reverse",
+                ]
+                if all(k in state_dict for k in keys):
+                    compute_dtype = self.w_ih_t.dtype
+
+                    w_ih_fwd = state_dict.pop(keys[0])
+                    w_ih_rev = state_dict.pop(keys[1])
+                    w_hh_fwd = state_dict.pop(keys[2])
+                    w_hh_rev = state_dict.pop(keys[3])
+                    b_ih_fwd = state_dict.pop(keys[4])
+                    b_ih_rev = state_dict.pop(keys[5])
+                    b_hh_fwd = state_dict.pop(keys[6])
+                    b_hh_rev = state_dict.pop(keys[7])
+
+                    w_ih_cat = (
+                        torch.cat([w_ih_fwd, w_ih_rev], dim=0)
+                        .to(dtype=compute_dtype)
+                        .contiguous()
+                    )
+                    w_ih_t = w_ih_cat.t().contiguous()
+
+                    w_hh_cat = (
+                        torch.cat([w_hh_fwd, w_hh_rev], dim=0)
+                        .to(dtype=compute_dtype)
+                        .contiguous()
                     )
 
-            current_stream.wait_stream(warmup_stream)
+                    bias_fwd = (b_ih_fwd + b_hh_fwd).to(dtype=torch.float32)
+                    bias_rev = (b_ih_rev + b_hh_rev).to(dtype=torch.float32)
+                    bias_cat = torch.cat([bias_fwd, bias_rev], dim=0).contiguous()
 
-            self._c.zero_()
-            self._out.zero_()
-            self._base_time.zero_()
-            self._length.fill_(self.max_length)
+                    state_dict[prefix + "w_ih_t"] = w_ih_t
+                    state_dict[prefix + "w_hh_cat"] = w_hh_cat
+                    state_dict[prefix + "bias_cat"] = bias_cat
 
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                lstm_triton(
-                    self._x,
-                    self._c,
-                    self._out,
-                    weights,
-                    self._base_time,
-                    self._length,
-                    graph_length,
-                    input_dim,
-                    hidden_dim,
-                    tile_n,
-                    tile_k,
-                    self.num_warps,
-                    self.num_stages,
-                )
-
-            graphs.append((graph_length, graph))
-
-        self._graphs = graphs
-        self._captured_signature = self._graph_signature()
-
-    def _ensure_graphs(self) -> None:
-        if self._graphs is None:
-            self._capture_graphs()
-            return
-
-        if self._captured_signature != self._graph_signature():
-            self._capture_graphs()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     @torch.inference_mode()
-    def forward(
-        self,
-        x: Tensor,
-        hx: tuple[Tensor, Tensor] | None = None,
-    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
-        if hx is not None:
-            raise ValueError("MyLSTM only supports zero initial hidden and cell state")
-
-        self._ensure_graphs()
-
-        if x.ndim != 3:
-            raise ValueError("input must be a 3D tensor")
-
-        input_dtype = x.dtype
-
-        if not x.is_floating_point():
-            raise ValueError("input must be a floating point tensor")
+    def forward(self, x: Tensor):
+        if not x.is_cuda:
+            raise ValueError("input must be CUDA")
+        if x.device != self.w_ih_t.device:
+            raise ValueError(
+                "input device must match FastGraphBiLSTM weights: "
+                f"got {x.device}, expected {self.w_ih_t.device}"
+            )
 
         if self.batch_first:
-            x_time_major = x.transpose(0, 1)
+            if x.ndim != 3:
+                raise ValueError("expected input shape (B, L, I)")
+            B, L, I = x.shape
+            if B != 1:
+                raise ValueError("FastGraphBiLSTM only supports B == 1")
+            x2d = x[0]
         else:
-            x_time_major = x
+            if x.ndim != 3:
+                raise ValueError("expected input shape (L, B, I)")
+            L, B, I = x.shape
+            if B != 1:
+                raise ValueError("FastGraphBiLSTM only supports B == 1")
+            x2d = x[:, 0, :]
 
-        length, batch_size, input_dim = x_time_major.shape
-
-        if batch_size != 1:
-            raise ValueError("MyLSTM only supports batch size 1")
-
-        if input_dim != self.input_size:
+        if L <= 0:
+            raise ValueError("empty sequences are not supported")
+        if L > self.max_seq_len:
             raise ValueError(
-                f"input has input_size={input_dim}, expected {self.input_size}"
+                f"sequence length {L} exceeds max_seq_len {self.max_seq_len}"
+            )
+        if I != self.input_dim:
+            raise ValueError(f"input_dim mismatch: got {I}, expected {self.input_dim}")
+        if x2d.dtype != self.w_ih_t.dtype:
+            raise TypeError(
+                f"input dtype must match compute dtype {self.w_ih_t.dtype}, got {x2d.dtype}"
             )
 
-        if length > self.max_length:
-            raise ValueError(
-                f"input length {length} exceeds max_length {self.max_length}"
-            )
+        if self.graphs is None:
+            self._capture_graphs()
 
-        if x_time_major.device != self.weight_ih_l0.device:
-            raise ValueError(
-                "input must be on the same CUDA device as the MyLSTM weights"
-            )
+        # Callers commonly form the LSTM input by transposing channel-first
+        # tensors, which produces a valid but non-contiguous [L, I] view.  Stage
+        # those views into a persistent workspace so the public contract matches
+        # nn.LSTM without introducing per-request CUDA allocations.
+        if not x2d.is_contiguous():
+            x2d_staged = self._x2d_contiguous[:L]
+            x2d_staged.copy_(x2d)
+            x2d = x2d_staged
 
-        hidden_dim = self.hidden_size
+        # Precompute all input-side gates in one GEMM:
+        #   (L, I) @ (I, 8H) -> (L, 8H)
+        torch.mm(x2d, self.w_ih_t, out=self._gates_x[:L])
 
-        self._refresh_combined_biases()
+        # Reset only graph time state.
+        # C does not need to be zeroed because logical_t == 0 uses implicit c_prev = 0.
+        _reset_base_length_kernel[(1,)](self._base, self._length, L)
 
-        self._c.zero_()
-        self._out.zero_()
-        self._base_time.zero_()
-        self._length.fill_(length)
+        remaining = L
+        for n, g in self.graphs:
+            while remaining >= n:
+                g.replay()
+                remaining -= n
 
-        if length > 0:
-            self._x[:length].copy_(x_time_major, non_blocking=True)
+        if remaining != 0:
+            raise RuntimeError("internal graph decomposition failed")
 
-            remaining = int(length)
-            processed = 0
+        out2d = self._out[:L]
 
-            for graph_length, graph in self._graphs:
-                if remaining >= graph_length:
-                    self._base_time.fill_(processed)
-                    graph.replay()
-
-                    processed += graph_length
-                    remaining -= graph_length
-
-            if remaining != 0:
-                raise RuntimeError("internal graph decomposition failed")
-
-        out_fp32 = self._out[:length]
+        if out2d.dtype != x.dtype:
+            out2d = out2d.to(x.dtype)
 
         if self.batch_first:
-            out_fp32 = out_fp32.transpose(0, 1)
-
-        out = out_fp32.to(dtype=input_dtype).clone(
-            memory_format=torch.contiguous_format
-        )
-
-        if length == 0:
-            h_n_fp32 = torch.zeros(
-                (2, 1, hidden_dim),
-                device=self._out.device,
-                dtype=torch.float32,
-            )
+            out = out2d.unsqueeze(0)
         else:
-            h_forward = self._out[length - 1, 0, :hidden_dim]
-            h_reverse = self._out[0, 0, hidden_dim:]
-            h_n_fp32 = torch.stack((h_forward, h_reverse), dim=0).unsqueeze(1)
+            out = out2d.unsqueeze(1)
 
-        c_forward = self._c[:hidden_dim]
-        c_reverse = self._c[hidden_dim:]
-        c_n_fp32 = torch.stack((c_forward, c_reverse), dim=0).unsqueeze(1)
-
-        h_n = h_n_fp32.to(dtype=input_dtype).clone(
-            memory_format=torch.contiguous_format
-        )
-        c_n = c_n_fp32.to(dtype=input_dtype).clone(
-            memory_format=torch.contiguous_format
-        )
-
-        return out, (h_n, c_n)
+        return out, None
