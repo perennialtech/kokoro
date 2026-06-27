@@ -981,20 +981,20 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cuda-python", specifier = ">=13.3.1" },
+    { name = "cuda-python", specifier = ">=13.3" },
     { name = "gradio", marker = "extra == 'ui'", specifier = ">=6.19.0" },
-    { name = "huggingface-hub" },
-    { name = "loguru" },
-    { name = "misaki", extras = ["en"], specifier = ">=0.9.4" },
-    { name = "numpy" },
-    { name = "onnx", specifier = ">=1.22.0" },
-    { name = "onnxscript", specifier = ">=0.7.0" },
+    { name = "huggingface-hub", specifier = ">=1.21" },
+    { name = "loguru", specifier = ">=0.7" },
+    { name = "misaki", extras = ["en"], specifier = ">=0.9" },
+    { name = "numpy", specifier = ">=2.2" },
+    { name = "onnx", specifier = ">=1.22" },
+    { name = "onnxscript", specifier = ">=0.7" },
     { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.25.0" },
-    { name = "tensorrt", specifier = ">=10.16.1.11" },
-    { name = "torch" },
-    { name = "torchvision", specifier = ">=0.27.1" },
-    { name = "transformers" },
-    { name = "triton", specifier = ">=3.7.1" },
+    { name = "tensorrt", specifier = ">=11.1" },
+    { name = "torch", specifier = ">=2.12" },
+    { name = "torchvision", specifier = ">=0.27" },
+    { name = "transformers", specifier = ">=5.12" },
+    { name = "triton", specifier = ">=3.7" },
 ]
 provides-extras = ["ui", "metrics"]
 
