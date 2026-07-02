@@ -21,7 +21,7 @@ dependencies = [
     "cuda-python>=13.3",
     "huggingface-hub>=1.21",
     "loguru>=0.7",
-    "misaki[en]>=0.9",
+    "misaki[en]",
     "numpy>=2.4",
     "onnx>=1.22",
     "onnxscript>=0.7",
@@ -38,6 +38,9 @@ kokoro = "kokoro.__main__:main"
 [tool.hatch.build.targets.wheel]
 only-include = ["kokoro"]
 only-packages = true
+
+[tool.uv.sources]
+misaki = { git = "https://github.com/perennialtech/misaki" }
 
 [dependency-groups]
 dev = [
