@@ -1019,7 +1019,7 @@ wheels = [
 [[package]]
 name = "misaki"
 version = "0.10.0"
-source = { git = "https://github.com/perennialtech/misaki#ce6e35150309886cc665baee82b064502f8eab81" }
+source = { git = "https://github.com/perennialtech/misaki#8a80bb2364adc99549db04b9ef2e76ed007c3bbc" }
 dependencies = [
     { name = "addict" },
     { name = "pip" },
