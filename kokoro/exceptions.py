@@ -1,7 +1,3 @@
-class OutOfProfileError(RuntimeError):
-    """Raised when predicted synthesis frames are outside the compiled TRT profile."""
-
-
 class TensorRTShapeError(RuntimeError):
     """Raised when TensorRT rejects or cannot resolve tensor shapes."""
 

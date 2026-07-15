@@ -4,7 +4,6 @@ from typing import Generator, Optional, Union
 import torch
 
 from .artifact import TensorRTArtifact
-from .exceptions import OutOfProfileError
 from .model import KokoroHostStages, KokoroModelLoader
 from .native_trt import NativeTRTEngine
 from .pipeline import TextFrontend, VoiceStore, normalize_language_code
@@ -50,10 +49,7 @@ class KokoroTRT:
         self.decoder_dtype = (
             torch.float16 if self.metadata.precision == "fp16" else torch.float32
         )
-        self.profile = self.metadata.profile
-        self.min_synthesis_frames = self.profile.min_frames
-        self.max_synthesis_frames = self.profile.max_frames
-        self.shape_plan = ShapePlan.from_model(self.host.model, self.profile)
+        self.shape_plan = ShapePlan.from_model(self.host.model)
 
         self.voice_store = VoiceStore(
             Path(voice_dir) if voice_dir is not None else self.artifact.paths.voice_dir
@@ -199,37 +195,6 @@ class KokoroTRT:
     ) -> torch.Tensor:
         profile = profile or NoOpProfileContext()
         synthesis_frames = int(frame_item.synthesis_frame_length)
-
-        with profile.span("runtime.profile_check") as span:
-            span.attrs.update(
-                {
-                    "synthesis_frames": synthesis_frames,
-                    "profile_min_frames": self.min_synthesis_frames,
-                    "profile_max_frames": self.max_synthesis_frames,
-                }
-            )
-            if (
-                synthesis_frames < self.min_synthesis_frames
-                or synthesis_frames > self.max_synthesis_frames
-            ):
-                profile.counter(
-                    "out_of_profile_total",
-                    1,
-                    (
-                        {
-                            "language": profile._base_labels().get("language", ""),
-                            "precision": self.metadata.precision,
-                        }
-                        if hasattr(profile, "_base_labels")
-                        else {"language": "", "precision": self.metadata.precision}
-                    ),
-                )
-                raise OutOfProfileError(
-                    "Predicted synthesis frame length "
-                    f"{synthesis_frames} is outside the TensorRT profile "
-                    f"[{self.min_synthesis_frames}, {self.max_synthesis_frames}]. "
-                    "Recompile with a wider --min-frames/--max-frames profile."
-                )
 
         asr = frame_item.asr.unsqueeze(0).to(self.device)
         en = frame_item.en.unsqueeze(0).to(self.device)

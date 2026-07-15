@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from .config import load_json, save_json
-from .shapes import Profile
 
 CONFIG_FILENAME = "config.json"
 TRT_METADATA_FILENAME = "metadata.json"
@@ -15,7 +14,7 @@ TRT_ENGINE_FILENAME = "generator_with_source_pyramid.plan"
 ONNX_FILENAME = "generator_with_source_pyramid.onnx"
 
 ARTIFACT_TYPE = "kokoro_generator_with_source_pyramid_tensorrt_plan"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -62,7 +61,6 @@ class ArtifactMetadata:
     precision: str
     workspace_size: Optional[int]
     builder_optimization_level: Optional[int]
-    profile: Profile
     shapes: dict[str, dict[str, tuple[int, ...]]]
     input_names: tuple[str, ...]
     output_names: tuple[str, ...]
@@ -80,7 +78,6 @@ class ArtifactMetadata:
         precision: str,
         workspace_size: Optional[int],
         builder_optimization_level: Optional[int],
-        profile: Profile,
         shapes: dict[str, dict[str, tuple[int, ...]]],
         input_names: tuple[str, ...],
         output_names: tuple[str, ...],
@@ -101,7 +98,6 @@ class ArtifactMetadata:
             precision=precision,
             workspace_size=workspace_size,
             builder_optimization_level=builder_optimization_level,
-            profile=profile,
             shapes=shapes,
             input_names=tuple(input_names),
             output_names=tuple(output_names),
@@ -125,7 +121,6 @@ class ArtifactMetadata:
             "gpu",
             "versions",
             "precision",
-            "profile",
             "shapes",
             "input_names",
             "output_names",
@@ -135,9 +130,6 @@ class ArtifactMetadata:
         missing = sorted(required - set(data))
         if missing:
             raise ValueError(f"TensorRT artifact metadata is missing keys: {missing}")
-
-        profile = Profile.from_dict(data["profile"])
-        shapes = cls._parse_shapes(data["shapes"])
 
         metadata = cls(
             artifact_type=str(data["artifact_type"]),
@@ -161,8 +153,7 @@ class ArtifactMetadata:
                 if data.get("builder_optimization_level") is None
                 else int(data["builder_optimization_level"])
             ),
-            profile=profile,
-            shapes=shapes,
+            shapes=cls._parse_shapes(data["shapes"]),
             input_names=tuple(str(name) for name in data["input_names"]),
             output_names=tuple(str(name) for name in data["output_names"]),
             onnx_opset=int(data["onnx_opset"]),
@@ -176,11 +167,14 @@ class ArtifactMetadata:
         if not isinstance(raw, dict):
             raise ValueError("metadata.shapes must be an object")
 
-        if set(raw) != {"min", "opt", "max"}:
-            raise ValueError("metadata.shapes must contain exactly min, opt, and max")
+        groups = ("lower", "preferred", "upper")
+        if set(raw) != set(groups):
+            raise ValueError(
+                "metadata.shapes must contain exactly lower, preferred, and upper"
+            )
 
         parsed: dict[str, dict[str, tuple[int, ...]]] = {}
-        for group in ("min", "opt", "max"):
+        for group in groups:
             specs = raw[group]
             if not isinstance(specs, dict):
                 raise ValueError(f"metadata.shapes.{group} must be an object")
@@ -248,8 +242,6 @@ class ArtifactMetadata:
         if not isinstance(expected_cc, str) or not expected_cc.startswith("sm_"):
             raise ValueError("metadata.gpu.compute_capability must look like sm_89")
 
-        self.profile.validate()
-
         if not self.input_names:
             raise ValueError("metadata.input_names must not be empty")
         if len(set(self.input_names)) != len(self.input_names):
@@ -292,7 +284,6 @@ class ArtifactMetadata:
             "precision": self.precision,
             "workspace_size": self.workspace_size,
             "builder_optimization_level": self.builder_optimization_level,
-            "profile": self.profile.to_dict(),
             "shapes": {
                 group: {name: list(shape) for name, shape in specs.items()}
                 for group, specs in self.shapes.items()

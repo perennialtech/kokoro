@@ -1,35 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Callable
 
-
-@dataclass(frozen=True)
-class Profile:
-    min_frames: int
-    opt_frames: int
-    max_frames: int
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Profile":
-        profile = cls(
-            min_frames=int(data["min_frames"]),
-            opt_frames=int(data["opt_frames"]),
-            max_frames=int(data["max_frames"]),
-        )
-        profile.validate()
-        return profile
-
-    def validate(self) -> None:
-        if self.min_frames < 1:
-            raise ValueError("min_frames must be positive")
-        if self.opt_frames < self.min_frames:
-            raise ValueError("opt_frames must be >= min_frames")
-        if self.max_frames < self.opt_frames:
-            raise ValueError("max_frames must be >= opt_frames")
-
-    def to_dict(self) -> dict[str, int]:
-        return asdict(self)
+AUTOMATIC_SYNTHESIS_FRAME_POINTS = (2, 256, 1024)
 
 
 @dataclass(frozen=True)
@@ -76,15 +50,12 @@ class Affine:
 
 @dataclass(frozen=True)
 class ShapePlan:
-    profile: Profile
     input_channels: int
     source_channels: tuple[int, ...]
     source_relations: tuple[Affine, ...]
 
     @classmethod
-    def from_model(cls, model, profile: Profile) -> "ShapePlan":
-        profile.validate()
-
+    def from_model(cls, model) -> "ShapePlan":
         generator = model.decoder.generator
         if not generator.ups:
             raise ValueError("Generator exposes no upsampling layers")
@@ -92,16 +63,10 @@ class ShapePlan:
         input_channels = int(generator.ups[0].in_channels)
         source_channels = tuple(int(c) for c in generator.source_channels())
 
-        min_generator = int(
-            model.decoder.generator_input_frame_length(profile.min_frames)
+        generator_points = tuple(
+            int(model.decoder.generator_input_frame_length(point))
+            for point in AUTOMATIC_SYNTHESIS_FRAME_POINTS
         )
-        opt_generator = int(
-            model.decoder.generator_input_frame_length(profile.opt_frames)
-        )
-        max_generator = int(
-            model.decoder.generator_input_frame_length(profile.max_frames)
-        )
-        generator_points = (min_generator, opt_generator, max_generator)
 
         relations = tuple(
             Affine.from_function(
@@ -118,7 +83,6 @@ class ShapePlan:
             raise ValueError("Source channel/relation metadata mismatch")
 
         return cls(
-            profile=profile,
             input_channels=input_channels,
             source_channels=source_channels,
             source_relations=relations,
@@ -167,61 +131,40 @@ class ShapePlan:
 
         return shapes
 
-    def profile_shapes(self, model) -> dict[str, dict[str, tuple[int, ...]]]:
+    def engine_shapes(self, model) -> dict[str, dict[str, tuple[int, ...]]]:
+        lower, preferred, upper = AUTOMATIC_SYNTHESIS_FRAME_POINTS
         return {
-            "min": self.shapes_for(model, self.profile.min_frames),
-            "opt": self.shapes_for(model, self.profile.opt_frames),
-            "max": self.shapes_for(model, self.profile.max_frames),
+            "lower": self.shapes_for(model, lower),
+            "preferred": self.shapes_for(model, preferred),
+            "upper": self.shapes_for(model, upper),
         }
-
-    def tensorrt_inputs(
-        self,
-        model,
-        dtype,
-        torch_tensorrt,
-    ) -> list[Any]:
-        shapes = self.profile_shapes(model)
-
-        return [
-            torch_tensorrt.Input(
-                min_shape=shapes["min"][name],
-                opt_shape=shapes["opt"][name],
-                max_shape=shapes["max"][name],
-                dtype=dtype,
-            )
-            for name in self.input_order()
-        ]
 
     def example_tensors(self, model, dtype):
         import torch
 
-        shapes = self.profile_shapes(model)
+        shapes = self.engine_shapes(model)
         return tuple(
-            torch.empty(shapes["opt"][name], device="cuda", dtype=dtype)
+            torch.empty(shapes["preferred"][name], device="cuda", dtype=dtype)
             for name in self.input_order()
         )
 
     def _generator_frames_dim(self, model):
         from torch.export import Dim
 
-        min_generator = self.generator_frames(model, self.profile.min_frames)
-        max_generator = self.generator_frames(model, self.profile.max_frames)
+        lower, _, upper = AUTOMATIC_SYNTHESIS_FRAME_POINTS
+        lower_generator = self.generator_frames(model, lower)
+        upper_generator = self.generator_frames(model, upper)
 
-        if min_generator < 3:
-            required_min = self.profile.min_frames
-            while self.generator_frames(model, required_min) < 3:
-                required_min += 1
-
+        if lower_generator < 3:
             raise ValueError(
-                "TensorRT export requires generator input length >= 3. "
-                f"With min_frames={self.profile.min_frames}, generator-frame length is "
-                f"{min_generator}. Use --min-frames {required_min} or higher."
+                "TensorRT export requires a generator input length of at least 3, "
+                f"but the automatic lower shape point produces {lower_generator}."
             )
 
         return Dim(
             "generator_frames",
-            min=int(min_generator),
-            max=int(max_generator),
+            min=int(lower_generator),
+            max=int(upper_generator),
         )
 
     def export_dynamic_shapes(self, model):

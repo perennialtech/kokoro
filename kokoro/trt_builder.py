@@ -61,9 +61,9 @@ def build_engine_from_onnx(
     for name in input_order:
         profile.set_shape(
             name,
-            min=tuple(shapes["min"][name]),
-            opt=tuple(shapes["opt"][name]),
-            max=tuple(shapes["max"][name]),
+            tuple(shapes["lower"][name]),
+            tuple(shapes["preferred"][name]),
+            tuple(shapes["upper"][name]),
         )
     config.add_optimization_profile(profile)
 

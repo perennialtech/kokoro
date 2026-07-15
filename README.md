@@ -11,7 +11,7 @@ from kokoro import KokoroTRT
 The public compile API is:
 
 ```python
-from kokoro import Profile, compile_artifact
+from kokoro import compile_artifact
 ```
 
 Artifacts contain a native TensorRT serialized plan loaded with `tensorrt.Runtime` and executed through `IExecutionContext.execute_async_v3`. Torch-TensorRT is not used.
@@ -57,13 +57,12 @@ uv run python -m kokoro.compile \
 Python:
 
 ```python
-from kokoro import Profile, compile_artifact
+from kokoro import compile_artifact
 
 compile_artifact(
     "./build",
     repo_id="hexgrad/Kokoro-82M",
     precision="fp16",
-    profile=Profile(min_frames=16, opt_frames=256, max_frames=1024),
     include_voices=["af_heart"],
 )
 ```
@@ -81,7 +80,7 @@ artifact/
     af_heart.pt
 ```
 
-TensorRT engines are profile-bound. If runtime predicts a synthesis frame length outside the compiled profile, synthesis raises a hard error before TensorRT execution. Recompile with a wider profile.
+TensorRT engines use automatically selected dynamic shape ranges.
 
 Compilation exports the generator boundary to ONNX and parses that ONNX with TensorRT. The compile step requires full TensorRT parser/operator coverage for the generator graph; parser errors are treated as hard failures.
 
@@ -140,7 +139,7 @@ uv run kokoro \
 ## Public API
 
 ```python
-from kokoro import KokoroTRT, Profile, compile_artifact
+from kokoro import KokoroTRT, compile_artifact
 ```
 
 ## Web UI
@@ -314,10 +313,6 @@ uv run python -m kokoro.profile \
 ```
 
 It reports p50/p90/p95/p99 latency, RTF, audio seconds per wall second, chars per second, stage CPU totals, stage CUDA totals, peak GPU memory, and errors by stage. Use `--input-file corpus.txt --split-pattern "\n+"` for corpus-style workloads.
-
-### Profile misses
-
-If synthesis predicts a frame count outside the compiled TensorRT profile, Kokoro raises `OutOfProfileError`, emits an error trace at `runtime.profile_check`, and increments `kokoro_tts_out_of_profile_total`. Recompile with a wider `--min-frames/--max-frames` range.
 
 ## Tests
 

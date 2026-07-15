@@ -1,9 +1,8 @@
 __version__ = "0.10.0"
 
 from .compile import compile_artifact
-from .exceptions import (OutOfProfileError, TensorRTDeserializationError,
-                         TensorRTExecutionError, TensorRTShapeError)
-from .shapes import Profile
+from .exceptions import (TensorRTDeserializationError, TensorRTExecutionError,
+                         TensorRTShapeError)
 from .telemetry import (InMemoryMetrics, InMemoryTraceSink, JsonlTraceSink,
                         LogSummarySink, ProfilerConfig, PrometheusMetrics,
                         Telemetry)
@@ -15,8 +14,6 @@ __all__ = [
     "JsonlTraceSink",
     "KokoroTRT",
     "LogSummarySink",
-    "OutOfProfileError",
-    "Profile",
     "ProfilerConfig",
     "PrometheusMetrics",
     "Telemetry",

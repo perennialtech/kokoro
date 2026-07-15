@@ -13,7 +13,7 @@ from .artifact import ArtifactMetadata, ArtifactPaths, TensorRTArtifact
 from .config import save_json
 from .model import GeneratorExportBuilder, KokoroModelLoader
 from .onnx_export import export_generator_onnx
-from .shapes import Profile, ShapePlan
+from .shapes import ShapePlan
 from .trt_builder import build_engine_from_onnx
 
 DEFAULT_ONNX_OPSET = 18
@@ -43,14 +43,14 @@ def get_tensorrt_version() -> Optional[str]:
         return None
 
 
-def validate_generator_profile_shapes(
+def validate_generator_shape_ranges(
     module: torch.nn.Module,
     model,
     plan: ShapePlan,
     dtype: torch.dtype,
-    groups: tuple[str, ...] = ("min",),
+    groups: tuple[str, ...] = ("lower",),
 ) -> None:
-    shapes = plan.profile_shapes(model)
+    shapes = plan.engine_shapes(model)
     input_order = plan.input_order()
 
     with torch.inference_mode():
@@ -69,13 +69,13 @@ def validate_generator_profile_shapes(
             except Exception as e:
                 formatted_shapes = {name: shapes[group][name] for name in input_order}
                 raise RuntimeError(
-                    f"Generator profile point {group!r} is not self-consistent "
+                    f"Generator shape point {group!r} is not self-consistent "
                     f"in PyTorch. Shapes: {formatted_shapes}"
                 ) from e
 
             if output.dim() != 3 or output.shape[0] != 1 or output.shape[1] != 1:
                 raise RuntimeError(
-                    f"Generator profile point {group!r} returned unexpected output "
+                    f"Generator shape point {group!r} returned unexpected output "
                     f"shape: {tuple(output.shape)}"
                 )
 
@@ -124,7 +124,6 @@ def copy_selected_voices(
 def metadata_for_compile(
     *,
     model,
-    profile: Profile,
     precision: str,
     shapes: dict[str, dict[str, tuple[int, ...]]],
     workspace_size: Optional[int],
@@ -152,7 +151,6 @@ def metadata_for_compile(
         precision=precision,
         workspace_size=workspace_size,
         builder_optimization_level=builder_optimization_level,
-        profile=profile,
         shapes=shapes,
         input_names=input_names,
         output_names=output_names,
@@ -173,7 +171,6 @@ def compile_artifact(
     repo_id: Optional[str] = None,
     config: Union[dict[str, Any], str, Path, None] = None,
     model: Optional[Union[str, Path]] = None,
-    profile: Optional[Profile] = None,
     precision: str = "fp32",
     workspace_size: Optional[int] = 512 * 1024 * 1024,
     builder_optimization_level: Optional[int] = 0,
@@ -190,15 +187,12 @@ def compile_artifact(
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = ArtifactPaths(output_dir)
 
-    profile = profile or Profile(min_frames=2, opt_frames=256, max_frames=1024)
-    profile.validate()
-
     dtype = torch.float16 if precision == "fp16" else torch.float32
     loader = KokoroModelLoader(repo_id=repo_id, config=config, model=model)
     kokoro_model = loader.load(load_weights=True)
 
-    plan = ShapePlan.from_model(kokoro_model, profile)
-    shapes = plan.profile_shapes(kokoro_model)
+    plan = ShapePlan.from_model(kokoro_model)
+    shapes = plan.engine_shapes(kokoro_model)
 
     save_json(paths.config_path, kokoro_model.config_data)
     kokoro_model.save_host_state(paths.host_state_path)
@@ -211,12 +205,11 @@ def compile_artifact(
     module = GeneratorExportBuilder.build(kokoro_model).to(device="cuda", dtype=dtype)
 
     if validate_profile:
-        validate_generator_profile_shapes(
+        validate_generator_shape_ranges(
             module=module,
             model=kokoro_model,
             plan=plan,
             dtype=dtype,
-            groups=("min",),
         )
 
     example_inputs = plan.example_tensors(kokoro_model, dtype)
@@ -244,7 +237,6 @@ def compile_artifact(
 
     metadata = metadata_for_compile(
         model=kokoro_model,
-        profile=profile,
         precision=precision,
         shapes=shapes,
         workspace_size=workspace_size,
@@ -304,11 +296,8 @@ def main() -> None:
         "--skip-profile-validation",
         "--skip_profile_validation",
         action="store_true",
-        help="Skip PyTorch preflight validation of TensorRT kMIN profile.",
+        help="Skip PyTorch preflight validation of the automatic TensorRT shape range.",
     )
-    parser.add_argument("--min-frames", "--min_frames", type=int, default=2)
-    parser.add_argument("--opt-frames", "--opt_frames", type=int, default=256)
-    parser.add_argument("--max-frames", "--max_frames", type=int, default=1024)
     parser.add_argument(
         "--onnx-opset", "--onnx_opset", type=int, default=DEFAULT_ONNX_OPSET
     )
@@ -325,11 +314,6 @@ def main() -> None:
         repo_id=args.repo_id,
         config=args.config,
         model=args.model,
-        profile=Profile(
-            min_frames=args.min_frames,
-            opt_frames=args.opt_frames,
-            max_frames=args.max_frames,
-        ),
         precision=args.precision,
         workspace_size=workspace_size,
         builder_optimization_level=args.builder_optimization_level,
