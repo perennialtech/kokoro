@@ -143,8 +143,8 @@ class ProsodyPredictor(nn.Module):
             bidirectional=True,
         )
         # NOTE: Give this LSTM leeway in max_seq_len as text chunks can
-        # have predicted spoken durations in frames that are slightly longer than
-        # their numerical phoneme count. For example, silence frames?
+        # have predicted spoken durations in frames that are longer than
+        # their numerical phoneme count.
         self.shared = FastGraphBiLSTM(raw_shared, max_seq_len=1024)
 
         self.F0 = nn.ModuleList(
