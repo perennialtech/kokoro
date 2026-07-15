@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional, Union
 
@@ -33,26 +32,7 @@ def build_engine_from_onnx(
     config = builder.create_builder_config()
     profile = builder.create_optimization_profile()
 
-    with open(onnx_path, "rb") as r:
-        model_data = r.read()
-
-    # FIXME: Review this:
-    # The ONNX exporter leverages external weights files (*.onnx.data).
-    # Because we're passing byte buffers to parser.parse(), TensorRT loses the
-    # directory context. We traverse to the output location so C-level POSIX file
-    # pointers resolve natively, and also explicitly supply `path=` if TRT respects it.
-    cwd = os.getcwd()
-    os.chdir(onnx_path.parent)
-    try:
-        try:
-            parsed = parser.parse(model_data, path=onnx_path.name)
-        except TypeError:
-            try:
-                parsed = parser.parse(model_data, onnx_path.name)
-            except TypeError:
-                parsed = parser.parse(model_data)
-    finally:
-        os.chdir(cwd)
+    parsed = parser.parse_from_file(str(onnx_path), trt.Logger.WARNING)
 
     if not parsed:
         errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
@@ -67,12 +47,8 @@ def build_engine_from_onnx(
         )
     config.add_optimization_profile(profile)
 
-    # FIXME: Review this:
-    # we can wrap the flag setting in an `hasattr` check so that strictly older TRT 8.x versions
-    # can still explicitly enable it while TRT 10.x versions can seamlessly skip it and compile dynamically.
     if precision == "fp16":
-        if hasattr(trt.BuilderFlag, "FP16"):
-            config.set_flag(trt.BuilderFlag.FP16)
+        config.set_flag(trt.BuilderFlag.FP16)
 
     if workspace_size is not None:
         workspace_size = int(workspace_size)

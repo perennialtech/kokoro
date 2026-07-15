@@ -4,12 +4,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from kokoro import Profile, compile_artifact
+from kokoro import compile_artifact
 from kokoro.artifact import TensorRTArtifact
 from kokoro.model import GeneratorExportBuilder, KokoroModelLoader
 from kokoro.native_trt import NativeTRTEngine
 from kokoro.shapes import ShapePlan
 from kokoro.telemetry import InMemoryTraceSink, ProfilerConfig, Telemetry
+from kokoro.trt_builder import build_engine_from_onnx
 
 
 def existing_artifact_dir() -> Path:
@@ -44,7 +45,6 @@ def test_native_compile_builds_artifact_and_metadata_loads(tmp_path, precision):
         repo_id=os.getenv("KOKORO_TRT_REPO_ID", "hexgrad/Kokoro-82M"),
         model=os.getenv("KOKORO_TRT_MODEL"),
         precision=precision,
-        profile=Profile(min_frames=16, opt_frames=32, max_frames=64),
         include_voices=[],
     )
 
@@ -57,13 +57,79 @@ def test_native_compile_builds_artifact_and_metadata_loads(tmp_path, precision):
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="native TensorRT tests require CUDA"
 )
+def test_build_engine_parses_onnx_with_external_weights(tmp_path):
+    if os.getenv("KOKORO_NATIVE_TRT_BUILD_TESTS") != "1":
+        pytest.skip("set KOKORO_NATIVE_TRT_BUILD_TESTS=1 to run native compile tests")
+
+    numpy = pytest.importorskip("numpy")
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("tensorrt")
+
+    from onnx import helper, numpy_helper
+
+    onnx_path = tmp_path / "external-data.onnx"
+    weights_path = tmp_path / "external-data.weights"
+    engine_path = tmp_path / "external-data.plan"
+
+    x = helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 1])
+    audio = helper.make_tensor_value_info("audio", onnx.TensorProto.FLOAT, [1, 1])
+    weight = numpy_helper.from_array(
+        numpy.asarray([[2.0]], dtype=numpy.float32),
+        name="weight",
+    )
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["x", "weight"], ["audio"])],
+        "external-data",
+        [x],
+        [audio],
+        initializer=[weight],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 18)],
+    )
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=weights_path.name,
+        size_threshold=0,
+        convert_attribute=False,
+    )
+
+    assert onnx_path.is_file()
+    assert weights_path.is_file()
+
+    shapes = {
+        "lower": {"x": (1, 1)},
+        "preferred": {"x": (1, 1)},
+        "upper": {"x": (1, 1)},
+    }
+    build_engine_from_onnx(
+        onnx_path=onnx_path,
+        engine_path=engine_path,
+        shapes=shapes,
+        input_order=("x",),
+        precision="fp32",
+        workspace_size=None,
+        builder_optimization_level=None,
+    )
+
+    assert engine_path.is_file()
+    assert engine_path.stat().st_size > 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="native TensorRT tests require CUDA"
+)
 def test_native_engine_runs_random_profile_points():
     artifact = TensorRTArtifact.load(existing_artifact_dir())
     engine = NativeTRTEngine(artifact.paths.engine_path)
     sink = InMemoryTraceSink()
     telemetry = Telemetry(ProfilerConfig(enabled=True), [sink])
 
-    for group in ("min", "opt", "max"):
+    for group in ("lower", "preferred", "upper"):
         chunk = telemetry.start_chunk()
         inputs = {
             name: torch.randn(
@@ -96,11 +162,11 @@ def test_native_engine_runs_random_profile_points():
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="native TensorRT tests require CUDA"
 )
-def test_native_engine_matches_pytorch_generator_at_opt_shape():
+def test_native_engine_matches_pytorch_generator_at_preferred_shape():
     artifact = TensorRTArtifact.load(existing_artifact_dir())
     model = load_model_for_artifact(artifact).to("cuda").eval()
-    plan = ShapePlan.from_model(model, artifact.metadata.profile)
-    shapes = plan.profile_shapes(model)["opt"]
+    plan = ShapePlan.from_model(model)
+    shapes = plan.engine_shapes(model)["preferred"]
 
     dtype = torch.float16 if artifact.metadata.precision == "fp16" else torch.float32
     torch_generator = (

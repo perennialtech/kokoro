@@ -204,34 +204,13 @@ class SineGen(nn.Module):
 
     def _f02sine(self, f0_values):
         rad_values = (f0_values / self.sampling_rate) % 1
-
-        # FIXME: Review this:
-        # TRT Dynamic Shape Fix: Use scale_factor instead of explicitly computing sizes
-        # that map to the dynamic inference time dimension (-1)
-        scale_down = 1.0 / self.upsample_scale
-        scale_up = float(self.upsample_scale)
-
-        rad = F.interpolate(
-            rad_values.transpose(1, 2),
-            scale_factor=scale_down,
-            mode="linear",
-            align_corners=False,
-        ).transpose(1, 2)
-
-        phase = torch.cumsum(rad, dim=1) * 2 * torch.pi
-
+        phase = torch.cumsum(rad_values, dim=1) * 2 * torch.pi
         phase = F.interpolate(
             phase.transpose(1, 2) * self.upsample_scale,
-            scale_factor=scale_up,
+            scale_factor=float(self.upsample_scale),
             mode="linear",
             align_corners=False,
         ).transpose(1, 2)
-
-        # TRT-safe truncation: Guarantees length perfectly matches expecting input
-        # (Slicing an existing tensor is absolutely TRT-compliant, unlike eager allocation)
-        target_len = f0_values.shape[1]
-        phase = phase[:, :target_len, :]
-
         return torch.sin(phase)
 
     def forward(self, f0):
@@ -242,7 +221,11 @@ class SineGen(nn.Module):
             dtype=f0.dtype,
         ).view(1, 1, -1)
         sine_waves = self._f02sine(f0 * harmonics) * self.sine_amp
-        uv = self._f02uv(f0)
+        uv = F.interpolate(
+            self._f02uv(f0).transpose(1, 2),
+            scale_factor=float(self.upsample_scale),
+            mode="nearest",
+        ).transpose(1, 2)
         noise = torch.zeros_like(sine_waves)
         return sine_waves * uv, uv, noise
 
@@ -399,14 +382,7 @@ class Generator(nn.Module):
         return self.source_frame_lengths(decoder_frames)[-1]
 
     def compute_harmonic_features(self, f0):
-        scale = int(self.source_upsample_scale)
-
-        f0 = f0.unsqueeze(1)
-        weight = torch.ones(1, 1, scale, device=f0.device, dtype=f0.dtype)
-        f0 = torch.nn.functional.conv_transpose1d(f0, weight, stride=scale)
-        f0 = f0.transpose(1, 2)
-
-        har_source, _, _ = self.m_source(f0)
+        har_source, _, _ = self.m_source(f0.unsqueeze(-1))
         har_source = har_source.transpose(1, 2)
 
         magnitude, phase = self.stft.transform(har_source)

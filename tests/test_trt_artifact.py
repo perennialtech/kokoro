@@ -27,15 +27,15 @@ def test_compiler_artifact_contains_required_files():
     assert TRT_ENGINE_FILENAME.endswith(".plan")
 
 
-def test_trt_metadata_precision_profile_and_source_shapes():
+def test_trt_metadata_precision_and_source_shapes():
     root = artifact_dir()
-
     metadata = json.loads((root / TRT_METADATA_FILENAME).read_text())
 
     assert (
         metadata["artifact_type"]
         == "kokoro_generator_with_source_pyramid_tensorrt_plan"
     )
+    assert metadata["format_version"] == 3
     assert metadata["engine_file"] == TRT_ENGINE_FILENAME
     assert metadata["engine_file"].endswith(".plan")
     assert metadata["onnx_file"] == ONNX_FILENAME
@@ -48,15 +48,10 @@ def test_trt_metadata_precision_profile_and_source_shapes():
     assert metadata["onnx_opset"] > 0
     assert metadata["tensorrt_runtime_api"]["execute"] == "execute_async_v3"
 
-    profile = metadata["profile"]
-    assert profile["min_frames"] >= 1
-    assert profile["opt_frames"] >= profile["min_frames"]
-    assert profile["max_frames"] >= profile["opt_frames"]
-
     shapes = metadata["shapes"]
-    assert set(shapes) == {"min", "opt", "max"}
+    assert set(shapes) == {"lower", "preferred", "upper"}
 
-    for group in ("min", "opt", "max"):
+    for group in ("lower", "preferred", "upper"):
         assert "x" in shapes[group]
         assert "ref_s" in shapes[group]
 
