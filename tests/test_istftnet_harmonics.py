@@ -54,19 +54,11 @@ def _legacy_harmonic_features(
     generator: Generator,
     low_rate_f0: torch.Tensor,
 ) -> torch.Tensor:
-    scale = generator.source_upsample_scale
-    expanded_f0 = F.conv_transpose1d(
-        low_rate_f0.unsqueeze(1),
-        torch.ones(
-            1,
-            1,
-            scale,
-            dtype=low_rate_f0.dtype,
-            device=low_rate_f0.device,
-        ),
-        stride=scale,
-    ).transpose(1, 2)
-    har_source, _, _ = generator.m_source(expanded_f0)
+    sine_waves, _, _ = _legacy_sinegen_forward(
+        generator.m_source.l_sin_gen,
+        low_rate_f0,
+    )
+    har_source = generator.m_source.l_tanh(generator.m_source.l_linear(sine_waves))
     magnitude, phase = generator.stft.transform(har_source.transpose(1, 2))
     return torch.cat([magnitude, phase], dim=1)
 
