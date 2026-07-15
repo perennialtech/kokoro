@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-AUTOMATIC_SYNTHESIS_FRAME_POINTS = (2, 256, 1024)
+AUTOMATIC_SYNTHESIS_FRAME_POINTS = (2, 256, 2048)
 
 
 @dataclass(frozen=True)
