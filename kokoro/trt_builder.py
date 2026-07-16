@@ -24,15 +24,20 @@ def build_engine_from_onnx(
 
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
-    # NOTE: Explicit batch is default for TensorRT 10.x and 11.x.
-    # explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    # network = builder.create_network(explicit_batch)
+
+    # Explicit batch is the default in TensorRT 10+.
     network = builder.create_network(0)
     parser = trt.OnnxParser(network, logger)
+
     config = builder.create_builder_config()
     profile = builder.create_optimization_profile()
 
-    parsed = parser.parse_from_file(str(onnx_path), trt.Logger.WARNING)
+    try:
+        parsed = parser.parse_from_file(str(onnx_path))
+    except TypeError:
+        # Compatibility with older TensorRT Python bindings, whose API was:
+        # parse_from_file(model_path, severity)
+        parsed = parser.parse_from_file(str(onnx_path), trt.Logger.WARNING)
 
     if not parsed:
         errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
@@ -45,6 +50,7 @@ def build_engine_from_onnx(
             tuple(shapes["preferred"][name]),
             tuple(shapes["upper"][name]),
         )
+
     config.add_optimization_profile(profile)
 
     if precision == "fp16":
@@ -54,17 +60,22 @@ def build_engine_from_onnx(
         workspace_size = int(workspace_size)
         if workspace_size <= 0:
             raise ValueError("workspace_size must be positive when provided")
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
+
+        config.set_memory_pool_limit(
+            trt.MemoryPoolType.WORKSPACE,
+            workspace_size,
+        )
 
     if builder_optimization_level is not None:
         builder_optimization_level = int(builder_optimization_level)
         if not 0 <= builder_optimization_level <= 5:
             raise ValueError("builder_optimization_level must be between 0 and 5")
+
         config.builder_optimization_level = builder_optimization_level
 
     serialized_engine = builder.build_serialized_network(network, config)
     if serialized_engine is None:
         raise RuntimeError("TensorRT build_serialized_network returned None")
 
-    with open(engine_path, "wb") as w:
-        w.write(bytes(serialized_engine))
+    with engine_path.open("wb") as f:
+        f.write(bytes(serialized_engine))
