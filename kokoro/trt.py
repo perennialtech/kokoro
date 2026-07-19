@@ -1,12 +1,12 @@
 from pathlib import Path
-from typing import Generator, Optional, Union
+from typing import Generator, Literal, Optional, Union
 
 import torch
 
 from .artifact import TensorRTArtifact
 from .model import KokoroHostStages, KokoroModelLoader
 from .native_trt import NativeTRTEngine
-from .pipeline import TextFrontend, VoiceStore, normalize_language_code
+from .pipeline import TextFrontend, VoiceStore
 from .runtime import synthesize_prepared_trt
 from .shapes import ShapePlan
 from .telemetry import (NoOpProfileContext, ProfileContext, Telemetry,
@@ -55,11 +55,16 @@ class KokoroTRT:
             Path(voice_dir) if voice_dir is not None else self.artifact.paths.voice_dir
         )
         self.voice_store.set_target(self.device, torch.float32)
-        self._frontends: dict[str, TextFrontend] = {}
+        self._frontends: dict[Literal["zh", "ja"], TextFrontend] = {}
 
-    def frontend(self, lang_code: str) -> TextFrontend:
-        lang_code = normalize_language_code(lang_code)
-        cached = self._frontends.get(lang_code)
+    def frontend(
+        self,
+        default_han_language: Literal["zh", "ja"],
+    ) -> TextFrontend:
+        if default_han_language not in ("zh", "ja"):
+            raise ValueError("default_han_language must be either 'zh' or 'ja'")
+
+        cached = self._frontends.get(default_han_language)
         if cached is not None:
             return cached
 
@@ -67,25 +72,24 @@ class KokoroTRT:
             raise ValueError("Artifact config does not contain a vocab")
 
         frontend = TextFrontend(
-            lang_code=lang_code,
-            repo_id=self.host.repo_id,
+            default_han_language=default_han_language,
             vocab=self.host.vocab,
             context_length=self.host.context_length,
             voice_store=self.voice_store,
         )
-        self._frontends[lang_code] = frontend
+        self._frontends[default_han_language] = frontend
         return frontend
 
     def prepare(
         self,
         text: Union[str, list[str]],
-        voice: Union[str, torch.Tensor],
-        language: str,
+        voice: str,
+        default_han_language: Literal["zh", "ja"],
         speed: float = 1.0,
         split_pattern: Optional[str] = r"\n+",
         profile: Optional[ProfileContext] = None,
     ):
-        yield from self.frontend(language).prepare(
+        yield from self.frontend(default_han_language).prepare(
             text=text,
             voice=voice,
             speed=speed,
@@ -103,13 +107,13 @@ class KokoroTRT:
     def synthesize(
         self,
         text: Union[str, list[str]],
-        voice: Union[str, torch.Tensor],
-        language: str,
+        voice: str,
+        default_han_language: Literal["zh", "ja"],
         speed: float = 1.0,
         split_pattern: Optional[str] = r"\n+",
     ) -> Generator[SynthesisResult, None, None]:
         request = self.telemetry.start_request(
-            language=language,
+            language=default_han_language,
             voice=voice,
             speed=speed,
             input_chars=(
@@ -124,7 +128,7 @@ class KokoroTRT:
             for prepared in self.prepare(
                 text=text,
                 voice=voice,
-                language=language,
+                default_han_language=default_han_language,
                 speed=speed,
                 split_pattern=split_pattern,
                 profile=request,
