@@ -1,63 +1,13 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import Callable, Generator, List, Literal, Optional, Union
 
 import torch
-from loguru import logger
-from misaki import en, espeak
+from misaki import MultilingualG2P, espeak
 
 from .telemetry import (NoOpProfileContext, ProfileContext,
                         normalize_voice_label)
-
-ALIASES = {
-    "en-us": "a",
-    "en-gb": "b",
-    "es": "e",
-    "fr-fr": "f",
-    "hi": "h",
-    "it": "i",
-    "pt-br": "p",
-    "ja": "j",
-    "zh": "z",
-}
-
-LANGUAGE_CODES = {
-    "a": "American English",
-    "b": "British English",
-    "e": "es",
-    "f": "fr-fr",
-    "h": "hi",
-    "i": "it",
-    "p": "pt-br",
-    "j": "Japanese",
-    "z": "Mandarin Chinese",
-}
-
-
-def normalize_language_code(lang_code: str) -> str:
-    lang_code = ALIASES.get(lang_code.lower(), lang_code.lower())
-    if lang_code not in LANGUAGE_CODES:
-        raise ValueError(f"Unsupported language code {lang_code!r}")
-    return lang_code
-
-
-def infer_language_from_voice(
-    language: Optional[str], voice: Union[str, torch.Tensor]
-) -> str:
-    if language:
-        return normalize_language_code(language)
-
-    if not isinstance(voice, str):
-        raise ValueError("--language is required when voice is a tensor")
-
-    stem = Path(voice).stem if voice.endswith(".pt") else voice
-    if not stem:
-        raise ValueError(
-            "--language is required when language cannot be inferred from voice"
-        )
-
-    return normalize_language_code(stem[0])
 
 
 @dataclass
@@ -67,7 +17,6 @@ class PreparedInput:
     input_ids: torch.Tensor
     ref_s: torch.Tensor
     speed: torch.Tensor
-    tokens: Optional[List[en.MToken]] = None
     text_index: Optional[int] = None
 
     @property
@@ -91,7 +40,17 @@ class VoiceStore:
         self.target_device = torch.device(device)
         self.target_dtype = dtype
 
+    @staticmethod
+    def _validate_american_voice(voice: str) -> None:
+        name = Path(voice).stem
+        if not name.startswith("a"):
+            raise ValueError(
+                f"Only American English voices are supported, not {name!r}"
+            )
+
     def _voice_path(self, voice: str) -> Path:
+        self._validate_american_voice(voice)
+
         path = Path(voice)
         if path.exists():
             return path
@@ -118,10 +77,10 @@ class VoiceStore:
     def load_single_voice(
         self,
         voice: str,
-        lang_code: Optional[str] = None,
         profile: Optional[ProfileContext] = None,
     ) -> torch.Tensor:
         profile = profile or NoOpProfileContext()
+        self._validate_american_voice(voice)
         voice_label, voice_kind = normalize_voice_label(voice)
 
         if voice in self.cpu_cache:
@@ -147,12 +106,6 @@ class VoiceStore:
             attrs={"voice_kind": voice_kind, "voice_label": voice_label},
         ):
             path = self._voice_path(voice)
-            name = path.stem
-
-        if lang_code is not None and not name.startswith(lang_code):
-            logger.warning(
-                f"Language mismatch, loading {name} voice into {lang_code} pipeline."
-            )
 
         with profile.span("voice.load_cpu", attrs={"voice_kind": voice_kind}) as span:
             pack = self._normalize_pack(torch.load(path, weights_only=True))
@@ -169,17 +122,13 @@ class VoiceStore:
 
     def _load_cpu(
         self,
-        voice: Union[str, torch.Tensor],
+        voice: str,
         *,
-        lang_code: Optional[str],
         delimiter: str = ",",
         profile: Optional[ProfileContext] = None,
     ) -> torch.Tensor:
         profile = profile or NoOpProfileContext()
         voice_label, voice_kind = normalize_voice_label(voice)
-
-        if isinstance(voice, torch.Tensor):
-            return self._normalize_pack(voice)
 
         if voice in self.cpu_cache:
             with profile.span(
@@ -194,7 +143,7 @@ class VoiceStore:
             return self.cpu_cache[voice]
 
         packs = [
-            self.load_single_voice(v.strip(), lang_code=lang_code, profile=profile)
+            self.load_single_voice(v.strip(), profile=profile)
             for v in voice.split(delimiter)
             if v.strip()
         ]
@@ -216,9 +165,8 @@ class VoiceStore:
 
     def load(
         self,
-        voice: Union[str, torch.Tensor],
+        voice: str,
         *,
-        lang_code: Optional[str] = None,
         delimiter: str = ",",
         device: Optional[Union[str, torch.device]] = None,
         dtype: Optional[torch.dtype] = None,
@@ -228,7 +176,6 @@ class VoiceStore:
         voice_label, voice_kind = normalize_voice_label(voice)
         base = self._load_cpu(
             voice,
-            lang_code=lang_code,
             delimiter=delimiter,
             profile=profile,
         )
@@ -245,14 +192,6 @@ class VoiceStore:
             target_device = base.device
         if target_dtype is None:
             target_dtype = base.dtype
-
-        if isinstance(voice, torch.Tensor):
-            with profile.span(
-                "voice.transfer_device",
-                cuda=target_device.type == "cuda",
-                attrs={"voice_kind": "tensor"},
-            ):
-                return base.to(device=target_device, dtype=target_dtype)
 
         key = (voice, str(target_device), str(target_dtype))
         cached = self.device_cache.get(key)
@@ -291,135 +230,30 @@ class VoiceStore:
 class TextFrontend:
     def __init__(
         self,
-        lang_code: str,
-        repo_id: str,
+        default_han_language: Literal["zh", "ja"],
         vocab: dict[str, int],
         context_length: int,
         voice_store: VoiceStore,
-        trf: bool = False,
-        en_callable: Optional[Callable[[str], str]] = None,
     ):
         if context_length <= 2:
             raise ValueError(
                 f"context_length must be greater than 2, got {context_length}"
             )
 
-        self.repo_id = repo_id
-        self.lang_code = normalize_language_code(lang_code)
         self.vocab = vocab
         self.context_length = int(context_length)
         self.max_phoneme_len = self.context_length - 2
         self.voice_store = voice_store
-
-        if self.lang_code in "ab":
-            try:
-                fallback = espeak.EspeakFallback(british=self.lang_code == "b")
-            except Exception as e:
-                logger.warning("EspeakFallback not enabled: OOD words will be skipped")
-                logger.warning(str(e))
-                fallback = None
-            self.g2p = en.G2P(
-                trf=trf,
-                british=self.lang_code == "b",
-                fallback=fallback,
-                unk="",
-            )
-        elif self.lang_code == "j":
-            try:
-                from misaki import ja
-
-                self.g2p = ja.JAG2P()
-            except ImportError:
-                logger.error(
-                    "You need to `pip install misaki[ja]` to use lang_code='j'"
-                )
-                raise
-        elif self.lang_code == "z":
-            try:
-                from misaki import zh
-
-                self.g2p = zh.ZHG2P(
-                    version=None if repo_id.endswith("/Kokoro-82M") else "1.1",
-                    en_callable=en_callable,
-                )
-            except ImportError:
-                logger.error(
-                    "You need to `pip install misaki[zh]` to use lang_code='z'"
-                )
-                raise
-        else:
-            language = LANGUAGE_CODES[self.lang_code]
-            logger.warning(
-                f"Using EspeakG2P(language='{language}'). Long text is chunked by "
-                "host-side sentence splitting."
-            )
-            self.g2p = espeak.EspeakG2P(language=language)
-
-    @staticmethod
-    def tokens_to_ps(tokens: List[en.MToken]) -> str:
-        return "".join(
-            (t.phonemes or "") + (" " if t.whitespace else "") for t in tokens
-        ).strip()
-
-    @staticmethod
-    def tokens_to_text(tokens: List[en.MToken]) -> str:
-        return "".join(t.text + t.whitespace for t in tokens).strip()
+        self.g2p = MultilingualG2P(
+            default_han_language=default_han_language,
+            fallback=espeak.EspeakFallback(british=False),
+        )
 
     def phonemes_to_ids(self, phonemes: str) -> List[int]:
         return [self.vocab[p] for p in phonemes if self.vocab.get(p) is not None]
 
     def phoneme_id_count(self, phonemes: str) -> int:
         return sum(1 for p in phonemes if self.vocab.get(p) is not None)
-
-    def waterfall_last(
-        self,
-        tokens: List[en.MToken],
-        next_count: int,
-        waterfall: List[str] = ["!.?…", ":;", ",—"],
-        bumps: List[str] = [")", "”"],
-    ) -> int:
-        for w in waterfall:
-            z = next(
-                (
-                    i
-                    for i, t in reversed(list(enumerate(tokens)))
-                    if t.phonemes in set(w)
-                ),
-                None,
-            )
-            if z is None:
-                continue
-            z += 1
-            if z < len(tokens) and tokens[z].phonemes in bumps:
-                z += 1
-            yielded_count = self.phoneme_id_count(TextFrontend.tokens_to_ps(tokens[:z]))
-            if next_count - yielded_count <= self.max_phoneme_len:
-                return z
-        return len(tokens)
-
-    def en_tokenize(
-        self,
-        tokens: List[en.MToken],
-    ) -> Generator[Tuple[str, str, List[en.MToken]], None, None]:
-        tks: List[en.MToken] = []
-
-        for t in tokens:
-            t.phonemes = t.phonemes or ""
-            next_count = self.phoneme_id_count(TextFrontend.tokens_to_ps([*tks, t]))
-
-            if next_count > self.max_phoneme_len and tks:
-                z = self.waterfall_last(tks, next_count)
-                yield (
-                    TextFrontend.tokens_to_text(tks[:z]),
-                    TextFrontend.tokens_to_ps(tks[:z]),
-                    tks[:z],
-                )
-                tks = tks[z:]
-
-            tks.append(t)
-
-        if tks:
-            yield TextFrontend.tokens_to_text(tks), TextFrontend.tokens_to_ps(tks), tks
 
     def split_phonemes_to_context(self, phonemes: str) -> Generator[str, None, None]:
         current: list[str] = []
@@ -445,9 +279,8 @@ class TextFrontend:
         self,
         graphemes: str,
         phonemes: str,
-        voice: Union[str, torch.Tensor],
+        voice: str,
         speed: Union[float, Callable[[int], float]] = 1,
-        tokens: Optional[List[en.MToken]] = None,
         text_index: Optional[int] = None,
         profile: Optional[ProfileContext] = None,
     ) -> PreparedInput:
@@ -457,14 +290,18 @@ class TextFrontend:
                 raise ValueError("Cannot prepare empty phoneme string")
 
             ids = self.phonemes_to_ids(phonemes)
+            if not ids:
+                raise ValueError(
+                    "Phoneme string does not contain any symbols in the model vocabulary"
+                )
             if len(ids) > self.max_phoneme_len:
                 raise ValueError(
-                    f"Tokenized phoneme payload too long: {len(ids)} > {self.max_phoneme_len}"
+                    f"Tokenized phoneme payload too long: {len(ids)} > "
+                    f"{self.max_phoneme_len}"
                 )
 
             pack = self.voice_store.load(
                 voice,
-                lang_code=self.lang_code,
                 profile=profile,
             )
             ref_index = min(len(phonemes) - 1, pack.shape[0] - 1)
@@ -481,76 +318,50 @@ class TextFrontend:
             return PreparedInput(
                 graphemes=graphemes,
                 phonemes=phonemes,
-                tokens=tokens,
                 text_index=text_index,
                 input_ids=torch.tensor([[0, *ids, 0]], dtype=torch.long),
                 ref_s=pack[ref_index].reshape(1, -1).contiguous(),
                 speed=torch.tensor(
-                    [float(speed_value)], dtype=torch.float32, device=pack.device
+                    [float(speed_value)],
+                    dtype=torch.float32,
+                    device=pack.device,
                 ),
             )
 
-    def prepare_from_tokens(
-        self,
-        tokens: Union[str, List[en.MToken]],
-        voice: Union[str, torch.Tensor],
-        speed: Union[float, Callable[[int], float]] = 1,
-        profile: Optional[ProfileContext] = None,
-    ) -> Generator[PreparedInput, None, None]:
-        profile = profile or NoOpProfileContext()
-
-        if isinstance(tokens, str):
-            if self.phoneme_id_count(tokens) > self.max_phoneme_len:
-                raise ValueError(
-                    f"Phoneme payload too long: {self.phoneme_id_count(tokens)} > "
-                    f"{self.max_phoneme_len}"
-                )
-            yield self.prepare_phonemes("", tokens, voice, speed, profile=profile)
-            return
-
-        with profile.span("frontend.tokenize"):
-            chunks = list(self.en_tokenize(tokens))
-
-        for gs, ps, tks in chunks:
-            if ps:
-                yield self.prepare_phonemes(
-                    gs,
-                    ps,
-                    voice,
-                    speed,
-                    tokens=tks,
-                    profile=profile,
-                )
-
     @staticmethod
-    def chunk_non_english_text(text: str, chunk_size: int = 400) -> List[str]:
-        chunks = []
-        sentences = re.split(r"([.!?]+)", text)
+    def chunk_text(text: str, chunk_size: int = 400) -> List[str]:
+        chunks: list[str] = []
         current = ""
 
-        for i in range(0, len(sentences), 2):
-            sentence = sentences[i]
-            if i + 1 < len(sentences):
-                sentence += sentences[i + 1]
+        for sentence in re.split(r"(?<=[.!?。！？])", text):
+            while sentence:
+                remaining = chunk_size - len(current)
+                if len(sentence) <= remaining:
+                    current += sentence
+                    break
 
-            if len(current) + len(sentence) <= chunk_size:
-                current += sentence
-            else:
-                if current.strip():
-                    chunks.append(current.strip())
-                current = sentence
+                if current:
+                    chunk = current.strip()
+                    if chunk:
+                        chunks.append(chunk)
+                    current = ""
+                    continue
 
-        if current.strip():
-            chunks.append(current.strip())
+                chunk = sentence[:chunk_size].strip()
+                if chunk:
+                    chunks.append(chunk)
+                sentence = sentence[chunk_size:]
 
-        return chunks or [
-            text[i : i + chunk_size] for i in range(0, len(text), chunk_size)
-        ]
+        chunk = current.strip()
+        if chunk:
+            chunks.append(chunk)
+
+        return chunks
 
     def prepare(
         self,
         text: Union[str, List[str]],
-        voice: Union[str, torch.Tensor],
+        voice: str,
         speed: Union[float, Callable[[int], float]] = 1,
         split_pattern: Optional[str] = r"\n+",
         profile: Optional[ProfileContext] = None,
@@ -572,45 +383,20 @@ class TextFrontend:
                 if not graphemes.strip():
                     continue
 
-                if self.lang_code in "ab":
+                for chunk in self.chunk_text(graphemes):
                     with profile.span("frontend.g2p") as g2p_span:
-                        _, tokens = self.g2p(graphemes)
-                        g2p_span.attrs["input_chars"] = len(graphemes)
-                    if tokens is None:
-                        continue
-
-                    with profile.span("frontend.tokenize"):
-                        tokenized = list(self.en_tokenize(tokens))
-
-                    for gs, ps, tks in tokenized:
-                        if ps:
-                            prepared_items.append(
-                                self.prepare_phonemes(
-                                    gs,
-                                    ps,
-                                    voice,
-                                    speed,
-                                    tokens=tks,
-                                    text_index=graphemes_index,
-                                    profile=profile,
-                                )
-                            )
-                    continue
-
-                for chunk in self.chunk_non_english_text(graphemes):
-                    with profile.span("frontend.g2p") as g2p_span:
-                        ps, _ = self.g2p(chunk)
+                        phonemes, _ = self.g2p(chunk)
                         g2p_span.attrs["input_chars"] = len(chunk)
 
                     with profile.span("frontend.tokenize"):
-                        ps_chunks = list(self.split_phonemes_to_context(ps))
+                        phoneme_chunks = list(self.split_phonemes_to_context(phonemes))
 
-                    for ps_chunk in ps_chunks:
-                        if ps_chunk:
+                    for phoneme_chunk in phoneme_chunks:
+                        if self.phoneme_id_count(phoneme_chunk):
                             prepared_items.append(
                                 self.prepare_phonemes(
                                     chunk,
-                                    ps_chunk,
+                                    phoneme_chunk,
                                     voice,
                                     speed,
                                     text_index=graphemes_index,
