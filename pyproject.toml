@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.31"]
 build-backend = "hatchling.build"
 
 [project]
@@ -19,16 +19,16 @@ classifiers = [
 requires-python = ">=3.11, <3.14"
 dependencies = [
     "cuda-python>=13.3",
-    "huggingface-hub>=1.21",
+    "huggingface-hub>=1.24",
     "loguru>=0.7",
-    "misaki[en]",
+    "misaki[en-sm,espeak,multilingual]>=0.11",
     "numpy>=2.4",
     "onnx>=1.22",
     "onnxscript>=0.7",
     "tensorrt>=11.1",
-    "torch>=2.12",
-    "torchvision>=0.27",
-    "transformers>=5.12",
+    "torch>=2.13",
+    "torchvision>=0.28",
+    "transformers>=5.14",
     "triton>=3.7",
 ]
 
@@ -44,12 +44,12 @@ misaki = { git = "https://github.com/perennialtech/misaki" }
 
 [dependency-groups]
 dev = [
-    "basedpyright>=1.39.8",
-    "black>=26.5.1",
-    "isort>=8.0.1",
-    "nvidia-modelopt>=0.44.0",
-    "pytest>=9.1.1",
-    "ruff>=0.15.19",
+    "basedpyright>=1.39",
+    "black>=26.5",
+    "isort>=8.0",
+    "nvidia-modelopt>=0.45",
+    "pytest>=9.1",
+    "ruff>=0.15",
 ]
 
 [project.urls]
@@ -58,8 +58,8 @@ Repository = "https://github.com/hexgrad/kokoro"
 
 [project.optional-dependencies]
 ui = [
-    "gradio>=6.19.0",
+    "gradio>=6.20",
 ]
 metrics = [
-    "prometheus-client>=0.25.0",
+    "prometheus-client>=0.25",
 ]
