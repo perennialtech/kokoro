@@ -1,11 +1,11 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import Callable, Generator, List, Optional, Union
 
 import torch
 from loguru import logger
-from misaki import en, espeak
+from misaki import MultilingualG2P
 
 from .telemetry import (NoOpProfileContext, ProfileContext,
                         normalize_voice_label)
@@ -67,7 +67,6 @@ class PreparedInput:
     input_ids: torch.Tensor
     ref_s: torch.Tensor
     speed: torch.Tensor
-    tokens: Optional[List[en.MToken]] = None
     text_index: Optional[int] = None
 
     @property
@@ -297,7 +296,6 @@ class TextFrontend:
         context_length: int,
         voice_store: VoiceStore,
         trf: bool = False,
-        en_callable: Optional[Callable[[str], str]] = None,
     ):
         if context_length <= 2:
             raise ValueError(
@@ -310,116 +308,16 @@ class TextFrontend:
         self.context_length = int(context_length)
         self.max_phoneme_len = self.context_length - 2
         self.voice_store = voice_store
-
-        if self.lang_code in "ab":
-            try:
-                fallback = espeak.EspeakFallback(british=self.lang_code == "b")
-            except Exception as e:
-                logger.warning("EspeakFallback not enabled: OOD words will be skipped")
-                logger.warning(str(e))
-                fallback = None
-            self.g2p = en.G2P(
-                trf=trf,
-                british=self.lang_code == "b",
-                fallback=fallback,
-                unk="",
-            )
-        elif self.lang_code == "j":
-            try:
-                from misaki import ja
-
-                self.g2p = ja.JAG2P()
-            except ImportError:
-                logger.error(
-                    "You need to `pip install misaki[ja]` to use lang_code='j'"
-                )
-                raise
-        elif self.lang_code == "z":
-            try:
-                from misaki import zh
-
-                self.g2p = zh.ZHG2P(
-                    version=None if repo_id.endswith("/Kokoro-82M") else "1.1",
-                    en_callable=en_callable,
-                )
-            except ImportError:
-                logger.error(
-                    "You need to `pip install misaki[zh]` to use lang_code='z'"
-                )
-                raise
-        else:
-            language = LANGUAGE_CODES[self.lang_code]
-            logger.warning(
-                f"Using EspeakG2P(language='{language}'). Long text is chunked by "
-                "host-side sentence splitting."
-            )
-            self.g2p = espeak.EspeakG2P(language=language)
-
-    @staticmethod
-    def tokens_to_ps(tokens: List[en.MToken]) -> str:
-        return "".join(
-            (t.phonemes or "") + (" " if t.whitespace else "") for t in tokens
-        ).strip()
-
-    @staticmethod
-    def tokens_to_text(tokens: List[en.MToken]) -> str:
-        return "".join(t.text + t.whitespace for t in tokens).strip()
+        self.g2p = MultilingualG2P(
+            default_han_language="ja" if self.lang_code == "j" else "zh",
+            trf=trf,
+        )
 
     def phonemes_to_ids(self, phonemes: str) -> List[int]:
         return [self.vocab[p] for p in phonemes if self.vocab.get(p) is not None]
 
     def phoneme_id_count(self, phonemes: str) -> int:
         return sum(1 for p in phonemes if self.vocab.get(p) is not None)
-
-    def waterfall_last(
-        self,
-        tokens: List[en.MToken],
-        next_count: int,
-        waterfall: List[str] = ["!.?…", ":;", ",—"],
-        bumps: List[str] = [")", "”"],
-    ) -> int:
-        for w in waterfall:
-            z = next(
-                (
-                    i
-                    for i, t in reversed(list(enumerate(tokens)))
-                    if t.phonemes in set(w)
-                ),
-                None,
-            )
-            if z is None:
-                continue
-            z += 1
-            if z < len(tokens) and tokens[z].phonemes in bumps:
-                z += 1
-            yielded_count = self.phoneme_id_count(TextFrontend.tokens_to_ps(tokens[:z]))
-            if next_count - yielded_count <= self.max_phoneme_len:
-                return z
-        return len(tokens)
-
-    def en_tokenize(
-        self,
-        tokens: List[en.MToken],
-    ) -> Generator[Tuple[str, str, List[en.MToken]], None, None]:
-        tks: List[en.MToken] = []
-
-        for t in tokens:
-            t.phonemes = t.phonemes or ""
-            next_count = self.phoneme_id_count(TextFrontend.tokens_to_ps([*tks, t]))
-
-            if next_count > self.max_phoneme_len and tks:
-                z = self.waterfall_last(tks, next_count)
-                yield (
-                    TextFrontend.tokens_to_text(tks[:z]),
-                    TextFrontend.tokens_to_ps(tks[:z]),
-                    tks[:z],
-                )
-                tks = tks[z:]
-
-            tks.append(t)
-
-        if tks:
-            yield TextFrontend.tokens_to_text(tks), TextFrontend.tokens_to_ps(tks), tks
 
     def split_phonemes_to_context(self, phonemes: str) -> Generator[str, None, None]:
         current: list[str] = []
@@ -447,7 +345,6 @@ class TextFrontend:
         phonemes: str,
         voice: Union[str, torch.Tensor],
         speed: Union[float, Callable[[int], float]] = 1,
-        tokens: Optional[List[en.MToken]] = None,
         text_index: Optional[int] = None,
         profile: Optional[ProfileContext] = None,
     ) -> PreparedInput:
@@ -481,7 +378,6 @@ class TextFrontend:
             return PreparedInput(
                 graphemes=graphemes,
                 phonemes=phonemes,
-                tokens=tokens,
                 text_index=text_index,
                 input_ids=torch.tensor([[0, *ids, 0]], dtype=torch.long),
                 ref_s=pack[ref_index].reshape(1, -1).contiguous(),
@@ -490,42 +386,24 @@ class TextFrontend:
                 ),
             )
 
-    def prepare_from_tokens(
+    def prepare_from_phonemes(
         self,
-        tokens: Union[str, List[en.MToken]],
+        phonemes: str,
         voice: Union[str, torch.Tensor],
         speed: Union[float, Callable[[int], float]] = 1,
         profile: Optional[ProfileContext] = None,
     ) -> Generator[PreparedInput, None, None]:
-        profile = profile or NoOpProfileContext()
-
-        if isinstance(tokens, str):
-            if self.phoneme_id_count(tokens) > self.max_phoneme_len:
-                raise ValueError(
-                    f"Phoneme payload too long: {self.phoneme_id_count(tokens)} > "
-                    f"{self.max_phoneme_len}"
-                )
-            yield self.prepare_phonemes("", tokens, voice, speed, profile=profile)
-            return
-
-        with profile.span("frontend.tokenize"):
-            chunks = list(self.en_tokenize(tokens))
-
-        for gs, ps, tks in chunks:
-            if ps:
-                yield self.prepare_phonemes(
-                    gs,
-                    ps,
-                    voice,
-                    speed,
-                    tokens=tks,
-                    profile=profile,
-                )
+        if self.phoneme_id_count(phonemes) > self.max_phoneme_len:
+            raise ValueError(
+                f"Phoneme payload too long: {self.phoneme_id_count(phonemes)} > "
+                f"{self.max_phoneme_len}"
+            )
+        yield self.prepare_phonemes("", phonemes, voice, speed, profile=profile)
 
     @staticmethod
-    def chunk_non_english_text(text: str, chunk_size: int = 400) -> List[str]:
+    def chunk_text(text: str, chunk_size: int = 400) -> List[str]:
         chunks = []
-        sentences = re.split(r"([.!?]+)", text)
+        sentences = re.split(r"([.!?。！？]+)", text)
         current = ""
 
         for i in range(0, len(sentences), 2):
@@ -572,32 +450,7 @@ class TextFrontend:
                 if not graphemes.strip():
                     continue
 
-                if self.lang_code in "ab":
-                    with profile.span("frontend.g2p") as g2p_span:
-                        _, tokens = self.g2p(graphemes)
-                        g2p_span.attrs["input_chars"] = len(graphemes)
-                    if tokens is None:
-                        continue
-
-                    with profile.span("frontend.tokenize"):
-                        tokenized = list(self.en_tokenize(tokens))
-
-                    for gs, ps, tks in tokenized:
-                        if ps:
-                            prepared_items.append(
-                                self.prepare_phonemes(
-                                    gs,
-                                    ps,
-                                    voice,
-                                    speed,
-                                    tokens=tks,
-                                    text_index=graphemes_index,
-                                    profile=profile,
-                                )
-                            )
-                    continue
-
-                for chunk in self.chunk_non_english_text(graphemes):
+                for chunk in self.chunk_text(graphemes):
                     with profile.span("frontend.g2p") as g2p_span:
                         ps, _ = self.g2p(chunk)
                         g2p_span.attrs["input_chars"] = len(chunk)
