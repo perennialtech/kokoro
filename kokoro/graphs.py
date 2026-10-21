@@ -1,4 +1,4 @@
-"""Bounded, exact-shape CUDA graphs for the text and duration stages."""
+"""Bounded, exact-shape CUDA graphs for the host inference stages."""
 
 import torch
 

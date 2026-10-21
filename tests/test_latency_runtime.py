@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from kokoro import KokoroTRT
+from kokoro.benchmark import SHORT_TEXTS
 
 
 @pytest.fixture(scope="module")
@@ -14,9 +15,14 @@ def runtime():
     artifact = os.getenv("KOKORO_TRT_ARTIFACT_DIR")
     if not artifact:
         pytest.skip("requires KOKORO_TRT_ARTIFACT_DIR")
-    result = KokoroTRT(artifact, verify_internal_shapes=True)
-    result.warmup()
-    return result
+    original = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        result = KokoroTRT(artifact, verify_internal_shapes=True)
+        result.warmup()
+        yield result
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = original
 
 
 @torch.inference_mode()
@@ -39,7 +45,7 @@ def test_text_graphs_match_eager_and_own_outputs(runtime, length):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("text", ["Hi.", "Hello, world!", "Please try again."])
+@pytest.mark.parametrize("text", SHORT_TEXTS)
 def test_graph_runtime_waveform_matches_eager(runtime, text):
     prepared = next(runtime.prepare(text, "af_heart", "zh"))
     text_graphs, render_graphs = runtime._text_graphs, runtime._render_graphs
