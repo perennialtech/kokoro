@@ -6,10 +6,12 @@ from typing import Optional, Union
 
 import torch
 
-from .exceptions import (TensorRTDeserializationError, TensorRTExecutionError,
-                         TensorRTShapeError)
-from .telemetry import (NoOpProfileContext, ProfileContext, shape_attr,
-                        tensor_nbytes)
+from .exceptions import (
+    TensorRTDeserializationError,
+    TensorRTExecutionError,
+    TensorRTShapeError,
+)
+from .telemetry import NoOpProfileContext, ProfileContext, shape_attr, tensor_nbytes
 
 
 def trt_dtype_to_torch(dtype) -> torch.dtype:
@@ -56,7 +58,9 @@ class NativeTRTEngine:
                 f"Failed to deserialize TensorRT plan: {engine_path}"
             )
 
-        context = engine.create_execution_context()
+        context = engine.create_execution_context(
+            trt.ExecutionContextAllocationStrategy.USER_MANAGED
+        )
         if context is None:
             raise TensorRTDeserializationError(
                 "Failed to create TensorRT execution context"
@@ -67,6 +71,7 @@ class NativeTRTEngine:
         self.context = context
         self.stream = torch.cuda.Stream()
         self._lock = threading.Lock()
+        self._context_memory: Optional[torch.Tensor] = None
 
         self.tensor_names: tuple[str, ...] = tuple(
             engine.get_tensor_name(i) for i in range(engine.num_io_tensors)
@@ -94,6 +99,28 @@ class NativeTRTEngine:
             raise TensorRTDeserializationError("TensorRT engine has no inputs")
         if not self.output_names:
             raise TensorRTDeserializationError("TensorRT engine has no outputs")
+
+    def _prepare_context_memory(self, profile: ProfileContext) -> None:
+        with profile.span("trt.context_memory") as span:
+            required = self.context.update_device_memory_size_for_shapes()
+            if required < 0:
+                raise TensorRTShapeError("TensorRT could not size context memory")
+            if required and (
+                self._context_memory is None or self._context_memory.numel() < required
+            ):
+                # The allocator must retain a replaced workspace until the last
+                # execution on the TensorRT stream has finished using it.
+                self._context_memory = torch.empty(
+                    required, dtype=torch.uint8, device="cuda"
+                )
+                self._context_memory.record_stream(self.stream)
+            memory = self._context_memory
+            self.context.set_device_memory(
+                0 if memory is None else memory.data_ptr(),
+                0 if memory is None else memory.numel(),
+            )
+            span.attrs["required_bytes"] = int(required)
+            span.attrs["allocated_bytes"] = 0 if memory is None else memory.numel()
 
     def run(
         self,
@@ -146,6 +173,8 @@ class NativeTRTEngine:
                             "TensorRT could not infer all tensor shapes; unresolved tensors: "
                             f"{list(unresolved)}"
                         )
+
+            self._prepare_context_memory(profile)
 
             outputs: dict[str, torch.Tensor] = {}
             with profile.span("trt.allocate_outputs") as span:

@@ -34,6 +34,7 @@ def mock_tts(monkeypatch):
         return df, dh, th
 
     tts.host.text_duration = mock_text_duration
+    tts._text_duration = mock_text_duration
 
     def mock_render_frame(frame_item, ref_s, profile=None):
         # Return valid mock audio depending on synthesis length
@@ -92,6 +93,6 @@ def test_synthesis_metadata_resilience(mock_tts, text, token_configs, dur_len):
     for t in prepared.tokens:
         if t.start_ts is not None and t.end_ts is not None:
             duration = t.end_ts - t.start_ts
-            assert duration < 500.0, (
-                f"Token mistakenly read EOS padding for calculating space_dur! {text!r}"
-            )
+            assert (
+                duration < 500.0
+            ), f"Token mistakenly read EOS padding for calculating space_dur! {text!r}"

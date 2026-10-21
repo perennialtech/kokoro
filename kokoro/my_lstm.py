@@ -275,7 +275,7 @@ class FastGraphBiLSTM(nn.Module):
 
         device = self.w_hh_cat.device
         H = self.hidden_dim
-        I = self.input_dim
+        input_dim = self.input_dim
         max_seq_len = self.max_seq_len
 
         self.register_buffer(
@@ -290,7 +290,7 @@ class FastGraphBiLSTM(nn.Module):
         self.register_buffer(
             "_x2d_contiguous",
             torch.empty(
-                (max_seq_len, I),
+                (max_seq_len, input_dim),
                 device=device,
                 dtype=self.w_ih_t.dtype,
             ),
@@ -488,14 +488,14 @@ class FastGraphBiLSTM(nn.Module):
         if self.batch_first:
             if x.ndim != 3:
                 raise ValueError("expected input shape (B, L, I)")
-            B, L, I = x.shape
+            B, L, input_dim = x.shape
             if B != 1:
                 raise ValueError("FastGraphBiLSTM only supports B == 1")
             x2d = x[0]
         else:
             if x.ndim != 3:
                 raise ValueError("expected input shape (L, B, I)")
-            L, B, I = x.shape
+            L, B, input_dim = x.shape
             if B != 1:
                 raise ValueError("FastGraphBiLSTM only supports B == 1")
             x2d = x[:, 0, :]
@@ -506,8 +506,10 @@ class FastGraphBiLSTM(nn.Module):
             raise ValueError(
                 f"sequence length {L} exceeds max_seq_len {self.max_seq_len}"
             )
-        if I != self.input_dim:
-            raise ValueError(f"input_dim mismatch: got {I}, expected {self.input_dim}")
+        if input_dim != self.input_dim:
+            raise ValueError(
+                f"input_dim mismatch: got {input_dim}, expected {self.input_dim}"
+            )
         if x2d.dtype != self.w_ih_t.dtype:
             raise TypeError(
                 f"input dtype must match compute dtype {self.w_ih_t.dtype}, got {x2d.dtype}"
@@ -533,14 +535,19 @@ class FastGraphBiLSTM(nn.Module):
         # C does not need to be zeroed because logical_t == 0 uses implicit c_prev = 0.
         _reset_base_length_kernel[(1,)](self._base, self._length, L)
 
-        remaining = L
-        for n, g in self.graphs:
-            while remaining >= n:
-                g.replay()
-                remaining -= n
+        if torch.cuda.is_current_stream_capturing():
+            # CUDA graph launches cannot be nested during stream capture.
+            # Emit the same kernels into the enclosing text-stage graph.
+            self._emit_recurrent_chunk(L)
+        else:
+            remaining = L
+            for n, g in self.graphs:
+                while remaining >= n:
+                    g.replay()
+                    remaining -= n
 
-        if remaining != 0:
-            raise RuntimeError("internal graph decomposition failed")
+            if remaining != 0:
+                raise RuntimeError("internal graph decomposition failed")
 
         out2d = self._out[:L]
 

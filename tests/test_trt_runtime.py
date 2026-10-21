@@ -31,13 +31,13 @@ def test_trt_runtime_synthesizes_inside_profile(telemetry_enabled):
     )
 
     voice = os.getenv("KOKORO_TRT_VOICE", "af_heart")
-    language = os.getenv("KOKORO_TRT_LANG", voice[0])
+    language = os.getenv("KOKORO_TRT_HAN_LANGUAGE", "zh")
 
     results = list(
         tts.synthesize(
             text="Hello from Kokoro TensorRT.",
             voice=voice,
-            language=language,
+            default_han_language=language,
             speed=1.0,
         )
     )
