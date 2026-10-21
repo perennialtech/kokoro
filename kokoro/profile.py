@@ -9,7 +9,6 @@ from pathlib import Path
 import torch
 
 from kokoro import KokoroTRT
-from kokoro.pipeline import LANGUAGE_CODES, infer_language_from_voice
 from kokoro.telemetry import JsonlTraceSink, ProfilerConfig, Telemetry
 
 
@@ -97,7 +96,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Kokoro TensorRT runtime")
     parser.add_argument("--artifact-dir", "--artifact_dir", type=Path, required=True)
     parser.add_argument("--voice", default="af_heart")
-    parser.add_argument("--language", choices=sorted(LANGUAGE_CODES))
+    parser.add_argument("--default-han-language", choices=("zh", "ja"), default="zh")
     parser.add_argument("--text")
     parser.add_argument("--input-file", "--input_file", type=Path)
     parser.add_argument("--split-pattern", "--split_pattern", default=r"\n+")
@@ -114,7 +113,6 @@ def main() -> None:
     if args.text is not None and args.input_file is not None:
         raise ValueError("Use --text or --input-file, not both")
     text = args.text if args.text is not None else args.input_file.read_text()
-    language = infer_language_from_voice(args.language, args.voice)
 
     sinks = [JsonlTraceSink(args.jsonl)] if args.jsonl else []
     telemetry = Telemetry(
@@ -133,7 +131,7 @@ def main() -> None:
             tts.synthesize(
                 text=text,
                 voice=args.voice,
-                language=language,
+                default_han_language=args.default_han_language,
                 speed=args.speed,
                 split_pattern=args.split_pattern,
             )
@@ -149,7 +147,7 @@ def main() -> None:
                 tts.synthesize(
                     text=text,
                     voice=args.voice,
-                    language=language,
+                    default_han_language=args.default_han_language,
                     speed=args.speed,
                     split_pattern=args.split_pattern,
                 )

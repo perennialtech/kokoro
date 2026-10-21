@@ -2,10 +2,14 @@ from typing import Any, Optional
 
 import torch
 
-from .telemetry import (ChunkProfile, NoOpProfileContext, ProfileContext,
-                        RequestProfile, shape_attr)
-from .types import (END_SILENCE_FRAMES, KEEP_EOS_FRAMES, FrameItem,
-                    SynthesisResult)
+from .telemetry import (
+    ChunkProfile,
+    NoOpProfileContext,
+    ProfileContext,
+    RequestProfile,
+    shape_attr,
+)
+from .types import END_SILENCE_FRAMES, KEEP_EOS_FRAMES, FrameItem, SynthesisResult
 
 
 def expand_frames(
@@ -113,7 +117,7 @@ def synthesize_prepared_trt(
             speed = speed.contiguous().to(device=tts.device, dtype=torch.float32)
 
         with chunk.span("host.text_duration", cuda=True):
-            duration_float, duration_hidden, text_hidden = tts.host.text_duration(
+            duration_float, duration_hidden, text_hidden = tts._text_duration(
                 input_ids,
                 ref_s,
                 speed,

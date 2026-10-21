@@ -193,3 +193,44 @@ def test_native_engine_matches_pytorch_generator_at_preferred_shape():
         assert torch.allclose(actual, expected, rtol=5e-2, atol=5e-2)
     else:
         assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="native TensorRT tests require CUDA"
+)
+def test_shape_sized_workspace_matches_static_context():
+    artifact = TensorRTArtifact.load(existing_artifact_dir())
+    engine = NativeTRTEngine(artifact.paths.engine_path)
+    static = engine.engine.create_execution_context()
+    assert static is not None
+
+    for group in ("lower", "preferred"):
+        inputs = {
+            name: torch.randn(
+                tuple(artifact.metadata.shapes[group][name]),
+                device="cuda",
+                dtype=engine.tensor_dtypes[name],
+            )
+            * 0.1
+            for name in engine.input_names
+        }
+        for name, tensor in inputs.items():
+            assert static.set_input_shape(name, tuple(tensor.shape))
+            static.set_tensor_address(name, tensor.data_ptr())
+        assert not static.infer_shapes()
+        expected = {
+            name: torch.empty(
+                tuple(static.get_tensor_shape(name)),
+                device="cuda",
+                dtype=engine.tensor_dtypes[name],
+            )
+            for name in engine.output_names
+        }
+        for name, tensor in expected.items():
+            static.set_tensor_address(name, tensor.data_ptr())
+        assert static.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+        actual = engine.run(inputs)
+        torch.cuda.synchronize()
+        for name in engine.output_names:
+            assert torch.isfinite(actual[name]).all()
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)

@@ -97,12 +97,26 @@ for i, result in enumerate(
     tts.synthesize(
         text="Hello from Kokoro running through TensorRT.",
         voice="af_heart",
-        language="a",
+        default_han_language="zh",
         speed=1.0,
     )
 ):
     sf.write(f"kokoro_trt_{i}.wav", result.audio.detach().cpu().numpy(), 24000)
 ```
+
+### Low-latency serving
+
+Reuse one `KokoroTRT` instance across requests, and synthesize a warmup utterance before accepting traffic. The first synthesis captures bounded, exact-shape CUDA graphs for short text and frame lengths. This increases warmup time to reduce first-audio latency on subsequent requests. Existing TensorRT artifacts work without recompilation.
+
+The runtime recomputes speech for every request; it does not cache audio or shorten the input. Stages outside their captured token or frame ranges use eager inference. Host inference runs in evaluation mode, without dropout. Each instance serializes GPU synthesis because its LSTM and graph workspaces are shared. Changing PyTorch math settings, such as enabling TF32, rebuilds the graphs at the next warmup or synthesis.
+
+To reduce startup work or obtain per-stage host profiles, disable graph capture:
+
+```python
+tts = KokoroTRT("./build", text_graph_max_tokens=0, render_graph_max_frames=0)
+```
+
+TensorRT workspace grows to fit the largest shape used by the instance, rather than reserving the artifact's maximum-profile workspace at load time. Longer requests can therefore increase retained GPU memory. CUDA graph storage is bounded and does not grow with request count.
 
 ## Native TensorRT inference: CLI
 
@@ -183,7 +197,7 @@ telemetry = Telemetry(
 )
 
 tts = KokoroTRT("./build", telemetry=telemetry)
-results = list(tts.synthesize("Hello from telemetry.", "af_heart", "a"))
+results = list(tts.synthesize("Hello from telemetry.", "af_heart", "zh"))
 print(results[0].profile)
 print(tts.telemetry.last_request_trace)
 ```
@@ -295,13 +309,28 @@ The UI displays telemetry-derived audio duration, latency, RTF, and a compact st
 
 ### Benchmark command
 
+A short-input TTFA benchmark measures the time from request start through the first audio tensor's copy to CPU, including text preparation and synthesis:
+
+```bash
+uv run python -m kokoro.benchmark \
+  --artifact-dir ./build \
+  --iterations 30 \
+  --json ttfa.json
+```
+
+The built-in English corpus contains independent inputs of at most 50 characters. Requests are shuffled, and only `Warm up.` is used for warmup; the report includes each input's first-use latency. Use `--input-file corpus.txt` for one independent request per nonempty line. Add `--tf32` when comparing against a service where Chatterbox enables TF32 math.
+
+Memory reporting includes PyTorch allocator peaks and a sampled GPU-process peak from `nvidia-smi`, including initialization and allocations outside PyTorch. Run in a fresh process. The sampler excludes GPU processes present before model load, so avoid starting other GPU jobs during a measurement. These measurements exclude voice conversion, transport, and client playback.
+
+See [the latency evaluation](docs/latency-evaluation.md) for methodology, results, and limitations.
+
 A dedicated benchmark runner is available:
 
 ```bash
 uv run python -m kokoro.profile \
   --artifact-dir ./build \
   --voice af_heart \
-  --language a \
+  --default-han-language zh \
   --text "Hello from Kokoro running through TensorRT." \
   --warmups 5 \
   --iterations 50 \
@@ -321,7 +350,7 @@ Artifact/runtime tests require a compiled TensorRT artifact:
 ```bash
 KOKORO_TRT_ARTIFACT_DIR=./build \
 KOKORO_TRT_VOICE=af_heart \
-KOKORO_TRT_LANG=a \
+KOKORO_TRT_HAN_LANGUAGE=zh \
 uv run pytest tests/test_trt_artifact.py tests/test_trt_runtime.py
 ```
 
