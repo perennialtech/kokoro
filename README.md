@@ -110,6 +110,8 @@ Reuse one `KokoroTRT` instance across requests, and synthesize a warmup utteranc
 
 The runtime recomputes speech for every request; it does not cache audio or shorten the input. Stages outside their captured token or frame ranges use eager inference. Host inference runs in evaluation mode, without dropout. Each instance serializes GPU synthesis because its LSTM and graph workspaces are shared. Changing PyTorch math settings, such as enabling TF32, rebuilds the graphs at the next warmup or synthesis.
 
+Text preparation is incremental: synthesis can yield the first audio chunk before phonemizing the remainder of a long input. Advancing the generator prepares the next chunk, rather than allocating all prepared inputs up front.
+
 To reduce startup work or obtain per-stage host profiles, disable graph capture:
 
 ```python

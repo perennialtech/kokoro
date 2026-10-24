@@ -329,11 +329,23 @@ class TextFrontend:
             )
 
     @staticmethod
-    def chunk_text(text: str, chunk_size: int = 400) -> List[str]:
-        chunks: list[str] = []
+    def chunk_text(text: str, chunk_size: int = 400) -> Generator[str, None, None]:
+        if len(text) <= chunk_size:
+            chunk = text.strip()
+            if chunk:
+                yield chunk
+            return
+
         current = ""
 
-        for sentence in re.split(r"(?<=[.!?。！？])", text):
+        def sentences():
+            start = 0
+            for boundary in re.finditer(r"(?<=[.!?。！？])", text):
+                yield text[start : boundary.end()]
+                start = boundary.end()
+            yield text[start:]
+
+        for sentence in sentences():
             while sentence:
                 remaining = chunk_size - len(current)
                 if len(sentence) <= remaining:
@@ -343,20 +355,18 @@ class TextFrontend:
                 if current:
                     chunk = current.strip()
                     if chunk:
-                        chunks.append(chunk)
+                        yield chunk
                     current = ""
                     continue
 
                 chunk = sentence[:chunk_size].strip()
                 if chunk:
-                    chunks.append(chunk)
+                    yield chunk
                 sentence = sentence[chunk_size:]
 
         chunk = current.strip()
         if chunk:
-            chunks.append(chunk)
-
-        return chunks
+            yield chunk
 
     def prepare(
         self,
@@ -367,23 +377,18 @@ class TextFrontend:
         profile: Optional[ProfileContext] = None,
     ) -> Generator[PreparedInput, None, None]:
         profile = profile or NoOpProfileContext()
-        prepared_items: list[PreparedInput] = []
+        if isinstance(text, str):
+            with profile.span("frontend.split") as split_span:
+                text = re.split(split_pattern, text.strip()) if split_pattern else [text]
+                split_span.attrs["chunks"] = len(text)
 
-        with profile.span("frontend.prepare_total") as total_span:
-            if isinstance(text, str):
-                with profile.span("frontend.split") as split_span:
-                    text = (
-                        re.split(split_pattern, text.strip())
-                        if split_pattern
-                        else [text]
-                    )
-                    split_span.attrs["chunks"] = len(text)
+        for graphemes_index, graphemes in enumerate(text):
+            if not graphemes.strip():
+                continue
 
-            for graphemes_index, graphemes in enumerate(text):
-                if not graphemes.strip():
-                    continue
-
-                for chunk in self.chunk_text(graphemes):
+            for chunk in self.chunk_text(graphemes):
+                prepared_items: list[PreparedInput] = []
+                with profile.span("frontend.prepare_total") as total_span:
                     with profile.span("frontend.g2p") as g2p_span:
                         phonemes, _ = self.g2p(chunk)
                         g2p_span.attrs["input_chars"] = len(chunk)
@@ -404,9 +409,8 @@ class TextFrontend:
                                 )
                             )
 
-            total_span.attrs["prepared_chunks"] = len(prepared_items)
+                    total_span.attrs["prepared_chunks"] = len(prepared_items)
 
-        for prepared in prepared_items:
-            yield prepared
+                yield from prepared_items
 
     __call__ = prepare
