@@ -50,9 +50,10 @@ class TextDurationGraphs:
         self.speed.copy_(speed)
         graph, outputs = entry
         graph.replay()
-        # Graphs share temporary storage and LSTM output buffers. Copy every
-        # result before another graph can replay; callers own these copies.
-        return tuple(output.clone() for output in outputs)
+        # Only durations escape the synthesis call. The two hidden tensors are
+        # consumed by expand_frames before the next serialized text replay, so
+        # copying them only adds device allocations and memory traffic.
+        return outputs[0].clone(), outputs[1], outputs[2]
 
 
 class RenderGraphs:
@@ -112,7 +113,10 @@ class RenderGraphs:
         self.ref_s.copy_(ref_s)
         graph, lengths = self.graphs[frames]
         graph.replay()
+        # The render results go straight into TensorRT on the same ordered
+        # inference stream. No result escapes render_frame, and the runtime
+        # serializes graph replays; keeping these views avoids copying the
+        # large harmonic/source buffers a second time.
         return tuple(
-            output[..., :length].clone(memory_format=torch.contiguous_format)
-            for output, length in zip(self.outputs, lengths)
+            output[..., :length] for output, length in zip(self.outputs, lengths)
         )

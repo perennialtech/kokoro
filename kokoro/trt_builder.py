@@ -53,8 +53,9 @@ def build_engine_from_onnx(
 
     config.add_optimization_profile(profile)
 
-    if precision == "fp16":
-        config.set_flag(trt.BuilderFlag.FP16)
+    # The exported ONNX graph already has FP16 inputs and weights when
+    # requested. TensorRT 11 uses their types directly and no longer exposes
+    # a BuilderFlag.FP16 switch.
 
     if workspace_size is not None:
         workspace_size = int(workspace_size)
