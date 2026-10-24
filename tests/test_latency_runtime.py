@@ -27,7 +27,7 @@ def runtime():
 
 @torch.inference_mode()
 @pytest.mark.parametrize("length", [3, 8, 17, 33, 64, 96, 97])
-def test_text_graphs_match_eager_and_own_outputs(runtime, length):
+def test_text_graphs_match_eager_and_own_durations(runtime, length):
     assert not runtime.host.training
     torch.manual_seed(length)
     ids = torch.randint(0, 100, (1, length), device="cuda")
@@ -37,10 +37,12 @@ def test_text_graphs_match_eager_and_own_outputs(runtime, length):
     actual = runtime._text_duration(ids, style, speed)
     for output, reference in zip(actual, expected):
         torch.testing.assert_close(output, reference, rtol=5e-5, atol=5e-6)
-    saved = tuple(x.clone() for x in actual)
+    saved_duration = actual[0].clone()
     changed = runtime._text_duration(ids.flip(1), style + 0.1, speed * 1.3)
-    for output, reference in zip(actual, saved):
-        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    # The hidden tensors are borrowed workspace views, consumed inside the
+    # serialized synthesis call. Predicted durations must remain independent
+    # because the public SynthesisResult exposes them to callers.
+    torch.testing.assert_close(actual[0], saved_duration, rtol=0, atol=0)
     assert not torch.allclose(changed[0], actual[0])
 
 
@@ -65,10 +67,14 @@ def test_graph_runtime_waveform_matches_eager(runtime, text):
 def test_graph_replay_uses_current_speed(runtime):
     prepared = next(runtime.prepare("Please try again.", "af_heart", "zh"))
     normal = runtime.synthesize_prepared(prepared)
+    saved_audio = normal.audio.clone()
+    saved_duration = normal.duration_float.clone()
     prepared.speed = prepared.speed * 1.3
     faster = runtime.synthesize_prepared(prepared)
     torch.testing.assert_close(faster.duration_float, normal.duration_float / 1.3)
     assert faster.sample_length < normal.sample_length
+    torch.testing.assert_close(normal.duration_float, saved_duration, rtol=0, atol=0)
+    torch.testing.assert_close(normal.audio, saved_audio, rtol=0, atol=0)
 
 
 def test_synthesis_is_safe_across_threads_and_streams(runtime):
