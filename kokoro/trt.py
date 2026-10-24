@@ -56,6 +56,15 @@ class KokoroTRT:
 
         self.host = KokoroHostStages(model).to(self.device).eval()
         self.generator = NativeTRTEngine(self.artifact.paths.engine_path)
+        if set(self.generator.input_names) != set(self.metadata.input_names):
+            raise ValueError("TensorRT engine inputs do not match artifact metadata")
+        if self.generator.output_names != self.metadata.output_names:
+            raise ValueError("TensorRT engine outputs do not match artifact metadata")
+        for name in self.generator.input_names:
+            if self.generator.tensor_dtypes[name] != torch.float16:
+                raise ValueError(f"TensorRT generator input {name!r} is not FP16")
+        if self.generator.tensor_dtypes["audio"] != torch.float32:
+            raise ValueError("TensorRT generator output must be FP32")
         self._inference_lock = threading.Lock()
         self._inference_stream = torch.cuda.Stream(device=self.device)
         self._text_graph_max_tokens = min(
@@ -68,9 +77,6 @@ class KokoroTRT:
         self._render_graphs: Optional[RenderGraphs] = None
         self._graph_math_mode: Optional[tuple] = None
 
-        self.decoder_dtype = (
-            torch.float16 if self.metadata.precision == "fp16" else torch.float32
-        )
         self.shape_plan = ShapePlan.from_model(self.host.model)
 
         self.voice_store = VoiceStore(
@@ -228,7 +234,7 @@ class KokoroTRT:
         profile: Optional[ProfileContext] = None,
     ) -> torch.Tensor:
         profile = profile or NoOpProfileContext()
-        dtype = self.decoder_dtype
+        dtype = torch.float16
 
         with profile.span(
             "trt.prepare_inputs",

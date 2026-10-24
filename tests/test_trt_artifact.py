@@ -35,13 +35,13 @@ def test_trt_metadata_precision_and_source_shapes():
         metadata["artifact_type"]
         == "kokoro_generator_with_source_pyramid_tensorrt_plan"
     )
-    assert metadata["format_version"] == 3
+    assert metadata["format_version"] == 4
     assert metadata["engine_file"] == TRT_ENGINE_FILENAME
     assert metadata["engine_file"].endswith(".plan")
     assert metadata["onnx_file"] == ONNX_FILENAME
     assert metadata["config_file"] == CONFIG_FILENAME
     assert metadata["host_state_file"] == HOST_STATE_FILENAME
-    assert metadata["precision"] in {"fp32", "fp16"}
+    assert metadata["precision"] == "fp16"
     assert metadata["input_names"][:2] == ["x", "ref_s"]
     assert any(name.startswith("source_") for name in metadata["input_names"])
     assert metadata["output_names"] == ["audio"]
@@ -69,3 +69,15 @@ def test_trt_metadata_precision_and_source_shapes():
             assert shape[0] == 1
             assert shape[1] > 0
             assert shape[2] > 0
+
+
+def test_onnx_generator_uses_half_inputs_and_float_audio():
+    onnx = pytest.importorskip("onnx")
+    model = onnx.load(str(artifact_dir() / ONNX_FILENAME), load_external_data=False)
+    assert model.graph.input
+    assert all(
+        value.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
+        for value in model.graph.input
+    )
+    assert len(model.graph.output) == 1
+    assert model.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT

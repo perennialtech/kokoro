@@ -22,7 +22,7 @@ def mock_tts(monkeypatch):
     chunk = MagicMock()
     chunk.trace = MagicMock()
     chunk.span.return_value.__enter__ = MagicMock()
-    chunk.span.return_value.__exit__ = MagicMock()
+    chunk.span.return_value.__exit__ = MagicMock(return_value=False)
     tts.telemetry.start_chunk.return_value = chunk
     tts.telemetry.start_chunk.owner = True
 
@@ -120,3 +120,21 @@ def test_frame_expansion_matches_expected_lengths_and_indices(end_silence, keep_
     assert torch.equal(item.asr[0], expected.float())
     assert torch.equal(item.en[0], expected.float())
     assert item.pred_dur.tolist() == repeats
+
+
+def test_non_finite_audio_is_rejected(mock_tts):
+    prepared = MagicMock()
+    prepared.input_ids = torch.zeros((1, 3), dtype=torch.long)
+    prepared.ref_s = torch.zeros((1, 256))
+    prepared.speed = torch.ones((1,))
+    prepared.input_length = 3
+    prepared.tokens = None
+
+    def non_finite_audio(frame_item, ref_s, profile=None):
+        return torch.full(
+            (1, 1, frame_item.synthesis_frame_length * 240), float("nan")
+        )
+
+    mock_tts.render_frame = non_finite_audio
+    with pytest.raises(RuntimeError, match="non-finite audio"):
+        synthesize_prepared_trt(mock_tts, prepared)

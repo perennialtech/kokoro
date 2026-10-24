@@ -4,6 +4,8 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from kokoro import KokoroTRT
 from kokoro import compile as compiler
 from kokoro.trt_builder import build_engine_from_onnx
@@ -15,6 +17,18 @@ def test_cli_uses_optimized_builder_by_default(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["kokoro.compile", "--output-dir", str(tmp_path)])
     compiler.main()
     assert requests[0]["builder_optimization_level"] == 3
+    assert "precision" not in requests[0]
+
+
+def test_cli_rejects_fp32_precision_option(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["kokoro.compile", "--output-dir", str(tmp_path), "--precision", "fp32"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        compiler.main()
+    assert exc.value.code == 2
 
 
 def test_cli_allows_explicit_builder_opt_out(monkeypatch, tmp_path):
@@ -69,7 +83,6 @@ def test_fp16_engine_uses_exported_precision_without_builder_flag(
             "upper": {"x": (1, 2, 16)},
         },
         input_order=("x",),
-        precision="fp16",
         workspace_size=None,
         builder_optimization_level=None,
     )

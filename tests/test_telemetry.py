@@ -10,7 +10,7 @@ from kokoro.telemetry import (InMemoryMetrics, InMemoryTraceSink,
 def test_span_records_cpu_duration():
     sink = InMemoryTraceSink()
     telemetry = Telemetry(ProfilerConfig(enabled=True), [sink])
-    request = telemetry.start_request(language="a", voice="af_heart", precision="fp32")
+    request = telemetry.start_request(language="a", voice="af_heart", precision="fp16")
 
     with request.span("unit.stage"):
         pass
@@ -22,7 +22,7 @@ def test_span_records_cpu_duration():
 
 def test_nested_spans_keep_parent_names():
     telemetry = Telemetry(ProfilerConfig(enabled=True))
-    request = telemetry.start_request(language="a", voice="af_heart", precision="fp32")
+    request = telemetry.start_request(language="a", voice="af_heart", precision="fp16")
 
     with request.span("outer"):
         with request.span("inner"):
@@ -38,7 +38,7 @@ def test_nested_spans_keep_parent_names():
 
 def test_exception_records_stage_and_request_error():
     telemetry = Telemetry(ProfilerConfig(enabled=True))
-    request = telemetry.start_request(language="a", voice="af_heart", precision="fp32")
+    request = telemetry.start_request(language="a", voice="af_heart", precision="fp16")
 
     with pytest.raises(ValueError):
         with request.span("boom"):
@@ -52,7 +52,7 @@ def test_exception_records_stage_and_request_error():
 def test_jsonl_sink_writes_valid_schema(tmp_path):
     path = tmp_path / "trace.jsonl"
     telemetry = Telemetry(ProfilerConfig(enabled=True), [JsonlTraceSink(path)])
-    request = telemetry.start_request(language="a", voice="af_heart", precision="fp32")
+    request = telemetry.start_request(language="a", voice="af_heart", precision="fp16")
     with request.span("x"):
         pass
     request.finalize("ok")
@@ -66,7 +66,7 @@ def test_jsonl_sink_writes_valid_schema(tmp_path):
 def test_in_memory_metrics_receives_counters_and_histograms():
     metrics = InMemoryMetrics()
     telemetry = Telemetry(ProfilerConfig(enabled=True), metrics=metrics)
-    request = telemetry.start_request(language="a", voice="af_heart", precision="fp32")
+    request = telemetry.start_request(language="a", voice="af_heart", precision="fp16")
     with request.span("x"):
         pass
     request.finalize("ok")

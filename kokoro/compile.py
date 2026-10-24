@@ -124,7 +124,6 @@ def copy_selected_voices(
 def metadata_for_compile(
     *,
     model,
-    precision: str,
     shapes: dict[str, dict[str, tuple[int, ...]]],
     workspace_size: Optional[int],
     builder_optimization_level: Optional[int],
@@ -148,7 +147,6 @@ def metadata_for_compile(
             "torch": torch.__version__,
             "tensorrt": tensorrt_version,
         },
-        precision=precision,
         workspace_size=workspace_size,
         builder_optimization_level=builder_optimization_level,
         shapes=shapes,
@@ -171,15 +169,12 @@ def compile_artifact(
     repo_id: Optional[str] = None,
     config: Union[dict[str, Any], str, Path, None] = None,
     model: Optional[Union[str, Path]] = None,
-    precision: str = "fp32",
     workspace_size: Optional[int] = 512 * 1024 * 1024,
     builder_optimization_level: Optional[int] = 3,
     validate_profile: bool = True,
     include_voices: Optional[list[str]] = None,
     onnx_opset: int = DEFAULT_ONNX_OPSET,
 ) -> None:
-    if precision not in {"fp32", "fp16"}:
-        raise ValueError("precision must be fp32 or fp16")
     if not torch.cuda.is_available():
         raise RuntimeError("Torch-TensorRT compilation requires CUDA")
 
@@ -187,7 +182,7 @@ def compile_artifact(
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = ArtifactPaths(output_dir)
 
-    dtype = torch.float16 if precision == "fp16" else torch.float32
+    dtype = torch.float16
     loader = KokoroModelLoader(repo_id=repo_id, config=config, model=model)
     kokoro_model = loader.load(load_weights=True)
 
@@ -203,6 +198,8 @@ def compile_artifact(
     )
 
     module = GeneratorExportBuilder.build(kokoro_model).to(device="cuda", dtype=dtype)
+    # Retain FP32 for inverse STFT; generator inputs and convolutions use FP16.
+    module.generator.stft.float()
 
     if validate_profile:
         validate_generator_shape_ranges(
@@ -230,14 +227,12 @@ def compile_artifact(
         engine_path=paths.engine_path,
         shapes=shapes,
         input_order=plan.input_order(),
-        precision=precision,
         workspace_size=workspace_size,
         builder_optimization_level=builder_optimization_level,
     )
 
     metadata = metadata_for_compile(
         model=kokoro_model,
-        precision=precision,
         shapes=shapes,
         workspace_size=workspace_size,
         builder_optimization_level=builder_optimization_level,
@@ -270,12 +265,6 @@ def main() -> None:
         action="append",
         dest="include_voices",
         help="Voice name from source repo or local .pt path. Repeat or comma-separate.",
-    )
-    parser.add_argument(
-        "--precision",
-        choices=["fp32", "fp16"],
-        default="fp32",
-        help="TensorRT enabled precision",
     )
     parser.add_argument(
         "--workspace-size-mib",
@@ -314,7 +303,6 @@ def main() -> None:
         repo_id=args.repo_id,
         config=args.config,
         model=args.model,
-        precision=args.precision,
         workspace_size=workspace_size,
         builder_optimization_level=args.builder_optimization_level,
         validate_profile=not args.skip_profile_validation,

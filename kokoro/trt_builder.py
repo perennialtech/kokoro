@@ -9,14 +9,10 @@ def build_engine_from_onnx(
     engine_path: Union[str, Path],
     shapes: dict[str, dict[str, tuple[int, ...]]],
     input_order: tuple[str, ...],
-    precision: str,
     workspace_size: Optional[int],
     builder_optimization_level: Optional[int],
 ) -> None:
     import tensorrt as trt
-
-    if precision not in {"fp32", "fp16"}:
-        raise ValueError("precision must be fp32 or fp16")
 
     onnx_path = Path(onnx_path).resolve()
     engine_path = Path(engine_path).resolve()
@@ -53,9 +49,8 @@ def build_engine_from_onnx(
 
     config.add_optimization_profile(profile)
 
-    # The exported ONNX graph already has FP16 inputs and weights when
-    # requested. TensorRT 11 uses their types directly and no longer exposes
-    # a BuilderFlag.FP16 switch.
+    # The exported ONNX graph has FP16 inputs and convolution weights and
+    # FP32 spectral reconstruction; TensorRT 11 uses these types directly.
 
     if workspace_size is not None:
         workspace_size = int(workspace_size)

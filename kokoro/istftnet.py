@@ -47,11 +47,12 @@ class ExplicitInstanceNorm1d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=-1, keepdim=True)
-        centered = x - mean
+        # FP16 squares can overflow. Accumulate normalization in FP32.
+        values = x.float()
+        mean = values.mean(dim=-1, keepdim=True)
+        centered = values - mean
         var = centered.square().mean(dim=-1, keepdim=True)
-        x = centered * torch.rsqrt(var + self.eps)
-        return x
+        return (centered * torch.rsqrt(var + self.eps)).to(x.dtype)
 
 
 class AdaIN1d(nn.Module):
@@ -447,8 +448,9 @@ class Generator(nn.Module):
             x = xs / self.num_kernels
 
         x = self.conv_post(F.leaky_relu(x))
-        spec = torch.exp(x[:, : self.post_n_fft // 2 + 1, :])
-        phase = torch.sin(x[:, self.post_n_fft // 2 + 1 :, :])
+        # Exponentiation and inverse STFT need FP32 dynamic range.
+        spec = torch.exp(x[:, : self.post_n_fft // 2 + 1, :].float())
+        phase = torch.sin(x[:, self.post_n_fft // 2 + 1 :, :].float())
         return self.stft.inverse(spec, phase)
 
     def forward_with_har(self, x, s, har):

@@ -14,7 +14,7 @@ TRT_ENGINE_FILENAME = "generator_with_source_pyramid.plan"
 ONNX_FILENAME = "generator_with_source_pyramid.onnx"
 
 ARTIFACT_TYPE = "kokoro_generator_with_source_pyramid_tensorrt_plan"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,6 @@ class ArtifactMetadata:
         checkpoint: dict[str, Any],
         gpu: dict[str, Any],
         versions: dict[str, Any],
-        precision: str,
         workspace_size: Optional[int],
         builder_optimization_level: Optional[int],
         shapes: dict[str, dict[str, tuple[int, ...]]],
@@ -95,7 +94,7 @@ class ArtifactMetadata:
             checkpoint=checkpoint,
             gpu=gpu,
             versions=versions,
-            precision=precision,
+            precision="fp16",
             workspace_size=workspace_size,
             builder_optimization_level=builder_optimization_level,
             shapes=shapes,
@@ -233,8 +232,8 @@ class ArtifactMetadata:
             raise ValueError(
                 f"Unsupported host_state_file {self.host_state_file!r}; expected {HOST_STATE_FILENAME!r}"
             )
-        if self.precision not in {"fp32", "fp16"}:
-            raise ValueError("metadata.precision must be fp32 or fp16")
+        if self.precision != "fp16":
+            raise ValueError("Only FP16 TensorRT artifacts are supported")
         if not self.repo_id:
             raise ValueError("metadata.repo_id must not be empty")
 

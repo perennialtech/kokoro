@@ -34,22 +34,20 @@ def load_model_for_artifact(artifact: TensorRTArtifact):
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="native TensorRT tests require CUDA"
 )
-@pytest.mark.parametrize("precision", ["fp32", "fp16"])
-def test_native_compile_builds_artifact_and_metadata_loads(tmp_path, precision):
+def test_native_compile_builds_artifact_and_metadata_loads(tmp_path):
     if os.getenv("KOKORO_NATIVE_TRT_BUILD_TESTS") != "1":
         pytest.skip("set KOKORO_NATIVE_TRT_BUILD_TESTS=1 to run native compile tests")
 
-    output_dir = tmp_path / f"artifact-{precision}"
+    output_dir = tmp_path / "artifact-fp16"
     compile_artifact(
         output_dir,
         repo_id=os.getenv("KOKORO_TRT_REPO_ID", "hexgrad/Kokoro-82M"),
         model=os.getenv("KOKORO_TRT_MODEL"),
-        precision=precision,
         include_voices=[],
     )
 
     artifact = TensorRTArtifact.load(output_dir)
-    assert artifact.metadata.precision == precision
+    assert artifact.metadata.precision == "fp16"
     assert artifact.paths.engine_path.is_file()
     assert artifact.paths.onnx_path.is_file()
 
@@ -71,10 +69,10 @@ def test_build_engine_parses_onnx_with_external_weights(tmp_path):
     weights_path = tmp_path / "external-data.weights"
     engine_path = tmp_path / "external-data.plan"
 
-    x = helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 1])
-    audio = helper.make_tensor_value_info("audio", onnx.TensorProto.FLOAT, [1, 1])
+    x = helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT16, [1, 1])
+    audio = helper.make_tensor_value_info("audio", onnx.TensorProto.FLOAT16, [1, 1])
     weight = numpy_helper.from_array(
-        numpy.asarray([[2.0]], dtype=numpy.float32),
+        numpy.asarray([[2.0]], dtype=numpy.float16),
         name="weight",
     )
     graph = helper.make_graph(
@@ -111,7 +109,6 @@ def test_build_engine_parses_onnx_with_external_weights(tmp_path):
         engine_path=engine_path,
         shapes=shapes,
         input_order=("x",),
-        precision="fp32",
         workspace_size=None,
         builder_optimization_level=None,
     )
@@ -126,6 +123,11 @@ def test_build_engine_parses_onnx_with_external_weights(tmp_path):
 def test_native_engine_runs_random_profile_points():
     artifact = TensorRTArtifact.load(existing_artifact_dir())
     engine = NativeTRTEngine(artifact.paths.engine_path)
+    assert set(engine.input_names) == set(artifact.metadata.input_names)
+    assert all(
+        engine.tensor_dtypes[name] == torch.float16 for name in engine.input_names
+    )
+    assert engine.tensor_dtypes["audio"] == torch.float32
     sink = InMemoryTraceSink()
     telemetry = Telemetry(ProfilerConfig(enabled=True), [sink])
 
@@ -135,11 +137,7 @@ def test_native_engine_runs_random_profile_points():
             name: torch.randn(
                 tuple(shape),
                 device="cuda",
-                dtype=(
-                    torch.float16
-                    if artifact.metadata.precision == "fp16"
-                    else torch.float32
-                ),
+                dtype=torch.float16,
             ).contiguous()
             for name, shape in artifact.metadata.shapes[group].items()
         }
@@ -149,6 +147,7 @@ def test_native_engine_runs_random_profile_points():
         assert set(outputs) == {"audio"}
         assert outputs["audio"].is_cuda
         assert outputs["audio"].numel() > 0
+        assert torch.isfinite(outputs["audio"]).all()
 
     stage_names = {stage.name for trace in sink.traces for stage in trace.stages}
     assert "trt.validate_inputs" in stage_names
@@ -168,10 +167,11 @@ def test_native_engine_matches_pytorch_generator_at_preferred_shape():
     plan = ShapePlan.from_model(model)
     shapes = plan.engine_shapes(model)["preferred"]
 
-    dtype = torch.float16 if artifact.metadata.precision == "fp16" else torch.float32
+    dtype = torch.float16
     torch_generator = (
         GeneratorExportBuilder.build(model).to(device="cuda", dtype=dtype).eval()
     )
+    torch_generator.generator.stft.float()
     native_engine = NativeTRTEngine(artifact.paths.engine_path)
 
     # Fix the input sample: the generator's exponentials amplify some random
@@ -194,10 +194,8 @@ def test_native_engine_matches_pytorch_generator_at_preferred_shape():
     actual = native_engine.run(inputs)["audio"].float()
     torch.cuda.current_stream().synchronize()
 
-    if artifact.metadata.precision == "fp16":
-        assert torch.allclose(actual, expected, rtol=5e-2, atol=5e-2)
-    else:
-        assert torch.allclose(actual, expected, rtol=1e-3, atol=1e-3)
+    assert torch.isfinite(actual).all()
+    assert torch.allclose(actual, expected, rtol=5e-2, atol=5e-2)
 
 
 @pytest.mark.skipif(
@@ -206,6 +204,10 @@ def test_native_engine_matches_pytorch_generator_at_preferred_shape():
 def test_shape_sized_workspace_matches_static_context():
     artifact = TensorRTArtifact.load(existing_artifact_dir())
     engine = NativeTRTEngine(artifact.paths.engine_path)
+    free_bytes, _ = torch.cuda.mem_get_info()
+    static_workspace = int(engine.engine.device_memory_size_v2)
+    if free_bytes < static_workspace + 256 * 1024 * 1024:
+        pytest.skip("Not enough free GPU memory for an additional static context")
     static = engine.engine.create_execution_context()
     assert static is not None
 
