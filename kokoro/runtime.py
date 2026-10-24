@@ -177,6 +177,8 @@ def synthesize_prepared_trt(
             samples_per_frame = audio.shape[-1] // frame_item.synthesis_frame_length
             sample_length = frame_item.return_frame_length * samples_per_frame
             audio = audio[..., :sample_length].reshape(-1).contiguous()
+            if not bool(torch.isfinite(audio).all().item()):
+                raise RuntimeError("TensorRT synthesis produced non-finite audio")
             chunk.trace.sample_length = int(sample_length)
             chunk.trace.audio_duration_s = float(sample_length) / 24000.0
             span.attrs.update(

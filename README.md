@@ -14,6 +14,12 @@ The public compile API is:
 from kokoro import compile_artifact
 ```
 
+Compilation and inference support FP16 generator engines only. The host
+text/duration and harmonic stages and the final spectral reconstruction
+retain FP32 operations where needed for numerical accuracy. Previous
+artifacts (including FP16 plans from older builds) are not supported;
+recompile them with the current compiler.
+
 Artifacts contain a native TensorRT serialized plan loaded with `tensorrt.Runtime` and executed through `IExecutionContext.execute_async_v3`. Torch-TensorRT is not used.
 
 ## Install
@@ -24,11 +30,9 @@ cd kokoro
 uv sync
 ```
 
-Install TensorRT Python bindings matching your CUDA stack. ONNX export also requires `onnx` and `onnxscript`:
-
-```bash
-uv pip install ".[trt]"
-```
+The declared dependencies include TensorRT, ONNX, and ONNXScript. You need a
+CUDA-capable GPU, a compatible NVIDIA driver, and the appropriate TensorRT
+libraries for your system.
 
 You also need `espeak-ng`:
 
@@ -62,7 +66,6 @@ from kokoro import compile_artifact
 compile_artifact(
     "./build",
     repo_id="hexgrad/Kokoro-82M",
-    precision="fp16",
     include_voices=["af_heart"],
 )
 ```
@@ -115,10 +118,10 @@ Reuse one `KokoroTRT` instance across requests, and synthesize a warmup utteranc
 
 By default, the render graph pool captures **2–160 frames** (subject to the model's
 maximum sequence length), versus 2–64 in previous builds. On the RTX 3080,
-this covered all 25 short benchmark sentences instead of just three, lowering
-measured median first-audio latency from 23.14 to 18.00 ms with a level-3 FP32
-engine. Peak PyTorch reserved GPU memory increased by roughly 126 MiB and
-startup plus warmup by about 6.6 seconds. Your results will depend on the GPU,
+this covered all 25 short benchmark sentences instead of just three in a prior
+FP32 comparison. The size and warmup tradeoffs still apply to FP16 builds.
+Peak PyTorch reserved GPU memory increased by roughly 126 MiB and startup
+plus warmup by about 6.6 seconds. Your results will depend on the GPU,
 artifact, and workload. On memory-constrained deployments, set
 `render_graph_max_frames=64` (or `0` to disable) when constructing `KokoroTRT`.
 

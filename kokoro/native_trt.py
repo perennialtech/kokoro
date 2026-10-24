@@ -146,6 +146,11 @@ class NativeTRTEngine:
                     raise ValueError(f"TensorRT input {name!r} must be a CUDA tensor")
                 if not tensor.is_contiguous():
                     raise ValueError(f"TensorRT input {name!r} must be contiguous")
+                if tensor.dtype != self.tensor_dtypes[name]:
+                    raise TypeError(
+                        f"TensorRT input {name!r} requires {self.tensor_dtypes[name]}, "
+                        f"got {tensor.dtype}"
+                    )
 
         with profile.span("trt.context_wait"):
             self._lock.acquire()
