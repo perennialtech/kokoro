@@ -174,8 +174,13 @@ def test_native_engine_matches_pytorch_generator_at_preferred_shape():
     )
     native_engine = NativeTRTEngine(artifact.paths.engine_path)
 
+    # Fix the input sample: the generator's exponentials amplify some random
+    # draws enough to make the FP32/FP16 comparison flaky.
+    rng = torch.Generator(device="cuda").manual_seed(1234)
     inputs = {
-        name: torch.randn(tuple(shapes[name]), device="cuda", dtype=dtype).contiguous()
+        name: torch.randn(
+            tuple(shapes[name]), device="cuda", dtype=dtype, generator=rng
+        ).contiguous()
         for name in plan.input_order()
     }
 
