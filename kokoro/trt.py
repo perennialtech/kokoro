@@ -29,7 +29,7 @@ class KokoroTRT:
         verify_internal_shapes: bool = False,
         telemetry: Optional[Telemetry] = None,
         text_graph_max_tokens: int = 96,
-        render_graph_max_frames: int = 64,
+        render_graph_max_frames: int = 160,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("KokoroTRT requires CUDA")
