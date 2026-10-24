@@ -40,7 +40,7 @@ only-include = ["kokoro"]
 only-packages = true
 
 [tool.uv.sources]
-misaki = { git = "https://github.com/perennialtech/misaki" }
+misaki = { git = "https://github.com/perennialtech/misaki", rev = "62b6d88609f052c5c3bcf1278b1e5357a7987be2" }
 
 [dependency-groups]
 dev = [
