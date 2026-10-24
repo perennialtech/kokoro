@@ -173,7 +173,7 @@ def compile_artifact(
     model: Optional[Union[str, Path]] = None,
     precision: str = "fp32",
     workspace_size: Optional[int] = 512 * 1024 * 1024,
-    builder_optimization_level: Optional[int] = 0,
+    builder_optimization_level: Optional[int] = 3,
     validate_profile: bool = True,
     include_voices: Optional[list[str]] = None,
     onnx_opset: int = DEFAULT_ONNX_OPSET,
@@ -288,7 +288,7 @@ def main() -> None:
         "--builder-optimization-level",
         "--builder_optimization_level",
         type=int,
-        default=0,
+        default=3,
         choices=[0, 1, 2, 3, 4, 5],
         help="TensorRT builder optimization level",
     )

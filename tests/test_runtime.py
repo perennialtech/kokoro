@@ -93,6 +93,30 @@ def test_synthesis_metadata_resilience(mock_tts, text, token_configs, dur_len):
     for t in prepared.tokens:
         if t.start_ts is not None and t.end_ts is not None:
             duration = t.end_ts - t.start_ts
-            assert (
-                duration < 500.0
-            ), f"Token mistakenly read EOS padding for calculating space_dur! {text!r}"
+            assert duration < 500.0, (
+                f"Token mistakenly read EOS padding for calculating space_dur! {text!r}"
+            )
+
+
+@pytest.mark.parametrize("end_silence,keep_eos", [(0, 0), (4, 0), (4, 2), (12, 6)])
+def test_frame_expansion_matches_expected_lengths_and_indices(end_silence, keep_eos):
+    from kokoro.runtime import expand_frames
+
+    durations = torch.tensor([[1.2, 2.6, 0.4, 4.1]])
+    channels = torch.arange(4, dtype=torch.float32).view(1, 4, 1).expand(1, 4, 2)
+    item = expand_frames(
+        durations,
+        channels,
+        channels,
+        end_silence_frames=end_silence,
+        keep_eos_frames=keep_eos,
+    )
+    repeats = [1, 3, 1, 4 + end_silence]
+    expected = torch.repeat_interleave(torch.arange(4), torch.tensor(repeats))
+    assert item.synthesis_frame_length == len(expected)
+    assert item.return_frame_length == max(
+        1, len(expected) - max(repeats[-1] - keep_eos, 0)
+    )
+    assert torch.equal(item.asr[0], expected.float())
+    assert torch.equal(item.en[0], expected.float())
+    assert item.pred_dur.tolist() == repeats

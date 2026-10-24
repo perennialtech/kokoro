@@ -80,7 +80,12 @@ artifact/
     af_heart.pt
 ```
 
-TensorRT engines use automatically selected dynamic shape ranges.
+TensorRT engines use automatically selected dynamic shape ranges. The compiler
+uses TensorRT builder optimization level 3 by default; this takes longer to
+build than level 0 but improves generator execution on the measured RTX 3080.
+The selected tactics and speedups depend on available GPU memory and the input
+shapes. You can use `--builder-optimization-level 0` for a faster build, or
+pass `builder_optimization_level=0` to `compile_artifact`.
 
 Compilation exports the generator boundary to ONNX and parses that ONNX with TensorRT. The compile step requires full TensorRT parser/operator coverage for the generator graph; parser errors are treated as hard failures.
 
@@ -107,6 +112,15 @@ for i, result in enumerate(
 ### Low-latency serving
 
 Reuse one `KokoroTRT` instance across requests, and synthesize a warmup utterance before accepting traffic. The first synthesis captures bounded, exact-shape CUDA graphs for short text and frame lengths. This increases warmup time to reduce first-audio latency on subsequent requests. Existing TensorRT artifacts work without recompilation.
+
+By default, the render graph pool captures **2–160 frames** (subject to the model's
+maximum sequence length), versus 2–64 in previous builds. On the RTX 3080,
+this covered all 25 short benchmark sentences instead of just three, lowering
+measured median first-audio latency from 23.14 to 18.00 ms with a level-3 FP32
+engine. Peak PyTorch reserved GPU memory increased by roughly 126 MiB and
+startup plus warmup by about 6.6 seconds. Your results will depend on the GPU,
+artifact, and workload. On memory-constrained deployments, set
+`render_graph_max_frames=64` (or `0` to disable) when constructing `KokoroTRT`.
 
 The runtime recomputes speech for every request; it does not cache audio or shorten the input. Stages outside their captured token or frame ranges use eager inference. Host inference runs in evaluation mode, without dropout. Each instance serializes GPU synthesis because its LSTM and graph workspaces are shared. Changing PyTorch math settings, such as enabling TF32, rebuilds the graphs at the next warmup or synthesis.
 

@@ -38,7 +38,14 @@ def expand_frames(
         if end_silence_frames > 0:
             d[-1] += end_silence_frames
 
-        idx = torch.repeat_interleave(torch.arange(n, device=duration_float.device), d)
+        # We already synchronized to obtain the total frame count above.
+        # Supplying output_size avoids a second implicit CUDA synchronization
+        # inside repeat_interleave to rediscover that same output shape.
+        idx = torch.repeat_interleave(
+            torch.arange(n, device=duration_float.device),
+            d,
+            output_size=predicted_frame_count + max(end_silence_frames, 0),
+        )
         synthesis_frame_length = int(idx.numel())
 
         asr = text_hidden[0, idx, :].transpose(0, 1).contiguous()
